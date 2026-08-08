@@ -1,0 +1,8 @@
+# Build output
+*.exe
+*.test
+*.out
+
+# OS / editor
+.DS_Store
+Thumbs.db
