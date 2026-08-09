@@ -79,12 +79,12 @@ type StatusFunc func(status string)
 // secrets, ...) do not break every module. Any field may be the zero value
 // in a minimal / test host, so nil-check optional dependencies before use.
 type Env struct {
-	// FilesDirectory is the absolute path to the directory holding the
-	// user-supplied input files referenced by file-kind config fields.
-	// Resolve a file value with filepath.Join(env.FilesDirectory, cfg.SomeFile).
+	// FilesDirectory is the absolute path to the data directory: config.json,
+	// operator-supplied input files, and store.db live here. Resolve a file
+	// value with filepath.Join(env.FilesDirectory, cfg.SomeFile).
 	FilesDirectory string
 
-	// Output streams output files to the task's working directory.
+	// Output streams output files to this run's folder under runs/.
 	Output OutputFunc
 
 	// Status updates the host status line.
@@ -108,7 +108,7 @@ type Env struct {
 // package doc for the implementation skeleton and lifecycle.
 type Module interface {
 	// Name returns the canonical module identifier (e.g. "example_bot").
-	// It is used as the JSON config filename and as a routing key.
+	// It is used as a routing key and store namespace.
 	Name() string
 
 	// Version returns a semver string for the module's implementation.

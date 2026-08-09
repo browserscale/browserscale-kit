@@ -21,8 +21,7 @@ type Renderer interface {
 	// form with errors visible. Returns nil only when the form is valid.
 	EditConfig(schema *form.Schema, filesDirectory string) error
 
-	// PromptProjectName collects a name for the new task. The Renderer is
-	// expected to reject names that contain reserved characters or that
-	// collide with an existing directory under tasksDirectory.
-	PromptProjectName(tasksDirectory string) (string, error)
+	// PromptRunName collects a name for this run's output folder under
+	// runsDirectory. Existing names are allowed (resume / append).
+	PromptRunName(runsDirectory string) (string, error)
 }

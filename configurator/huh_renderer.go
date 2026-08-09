@@ -427,17 +427,18 @@ func buildWidget(f *form.Field, filesDirectory string) (huh.Field, error) {
 	return nil, fmt.Errorf("field %q: unsupported kind %q", f.Name, f.Kind)
 }
 
-// ---------------- PromptProjectName ----------------
+// ---------------- PromptRunName ----------------
 
-func (r *HuhRenderer) PromptProjectName(tasksDirectory string) (string, error) {
+func (r *HuhRenderer) PromptRunName(runsDirectory string) (string, error) {
+	_ = runsDirectory
 	var name string
 	err := huh.NewForm(huh.NewGroup(
 		huh.NewInput().
-			Title("Project name").
-			Description("A folder with this name will be created under Tasks/").
+			Title("Run name").
+			Description("Output goes to runs/<name>/ (reuse a name to append to a previous run)").
 			Value(&name).
 			Validate(func(s string) error {
-				return ValidateProjectName(tasksDirectory, s)
+				return ValidateRunName(s)
 			}),
 	)).WithTheme(r.theme()).Run()
 	if err != nil {

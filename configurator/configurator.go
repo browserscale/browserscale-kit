@@ -1,11 +1,10 @@
 // Package configurator orchestrates the configuration phase of a task:
 // pick a module from the registry, load any existing JSON config, let
-// the user edit it through a Renderer, validate, save, and ask for a
-// project name.
+// the user edit it through a Renderer, validate, save, and pick a run name.
 //
 // All UI work lives in a Renderer (see renderer.go and huh_renderer.go);
 // the Configurator itself is purely flow control + JSON I/O so we can
-// swap front-ends (CLI now, GUI later) without touching modules or task
+// swap front-ends (CLI now, GUI later) without touching modules or run
 // setup.
 package configurator
 
@@ -13,65 +12,65 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/browserscale/browserscale-kit/module"
 )
 
-// Configurator drives the configuration phase of a task.
+// Configurator drives the configuration phase before a run.
 //
-// All three directory fields are absolute paths.
+// ConfigPath, FilesDirectory and RunsDirectory are absolute paths.
+// FilesDirectory is typically the same directory that holds ConfigPath
+// (./data): config.json, input files, and store.db live together.
 type Configurator struct {
-	ConfigsDirectory string
-	FilesDirectory   string
-	TasksDirectory   string
-	Renderer         Renderer
+	// ConfigPath is the single JSON config file (e.g. data/config.json).
+	ConfigPath string
+	// FilesDirectory holds operator-supplied input files referenced by
+	// file-kind config fields (usually the same as the config's directory).
+	FilesDirectory string
+	// RunsDirectory is the parent of per-run output folders (./runs).
+	RunsDirectory string
+	Renderer      Renderer
 
 	// Optional non-interactive overrides. When set, the corresponding
 	// step is skipped:
 	//
-	//   - PreselectedModuleName: module is looked up in the registry by
-	//     Name() instead of asking the user.
-	//   - ConfigPathOverride: schema is loaded from this absolute path
-	//     instead of <ConfigsDirectory>/<moduleName>.json, the editor
-	//     is skipped, and the file is never written back.
-	//   - PreselectedTaskName: ValidateProjectName runs on the supplied
-	//     name and, if it passes, no prompt is shown.
-	//
-	// Each override is independent — providing only a subset still lets
-	// the user complete the rest interactively.
+	//   - PreselectedModuleName: module is looked up by Name().
+	//   - PreselectedRunName: validated and used as the run folder name.
+	//   - SkipEdit: load + validate ConfigPath, do not open the editor
+	//     and do not write the file back. Requires ConfigPath to exist.
+	//     When PreselectedRunName is also empty, a timestamp run name is
+	//     chosen automatically.
 	PreselectedModuleName string
-	ConfigPathOverride    string
-	PreselectedTaskName   string
+	PreselectedRunName    string
+	SkipEdit              bool
 }
 
-// Result is everything the caller (cli/cmd) needs to launch the task.
+// Result is everything the caller needs to launch the run.
 type Result struct {
-	Module      module.Module
-	ProjectName string
+	Module  module.Module
+	RunName string
 }
 
 // Run drives the full configuration flow:
 //
-//  1. Pick the module — either via PreselectedModuleName or
-//     Renderer.SelectModule. When exactly one module is registered and
-//     no name was preselected, it is chosen automatically (single-module
-//     repos are the common case) and no picker is shown.
-//  2. schema.ApplyDefaults() then LoadJSON from ConfigPathOverride if
-//     set, else from <ConfigsDirectory>/<moduleName>.json (if it
-//     exists), so the user sees their previous values as starting
-//     points.
-//  3. EditConfig — skipped when ConfigPathOverride is set; otherwise
-//     the renderer loops until the schema validates against
-//     FilesDirectory or the user cancels.
-//  4. SaveJSON back to <ConfigsDirectory>/<moduleName>.json — skipped
-//     when ConfigPathOverride is set so we don't trample the user's
-//     externally-supplied file.
-//  5. Pick a project name — either via PreselectedTaskName or
-//     Renderer.PromptProjectName.
+//  1. Pick the module — PreselectedModuleName, or auto when exactly one
+//     module is registered, else Renderer.SelectModule.
+//  2. schema.ApplyDefaults() then LoadJSON from ConfigPath when it exists.
+//  3. EditConfig — skipped when SkipEdit; otherwise the renderer loops
+//     until the schema validates against FilesDirectory.
+//  4. SaveJSON to ConfigPath — skipped when SkipEdit.
+//  5. Pick a run name — PreselectedRunName, or a timestamp when SkipEdit,
+//     else Renderer.PromptRunName.
 //
 // On user cancellation at any interactive step, an error wrapping
-// ErrCanceled is returned and no persistence occurs.
+// ErrCanceled is returned and no persistence occurs (except edits already
+// saved in step 4 when the user cancels the run-name prompt).
 func (c *Configurator) Run(modules []module.Module) (*Result, error) {
+	if c.ConfigPath == "" {
+		return nil, fmt.Errorf("configurator: ConfigPath is required")
+	}
+
 	selected, err := c.pickModule(modules)
 	if err != nil {
 		return nil, err
@@ -80,57 +79,44 @@ func (c *Configurator) Run(modules []module.Module) (*Result, error) {
 	schema := selected.Schema()
 	schema.ApplyDefaults()
 
-	defaultConfigPath := filepath.Join(c.ConfigsDirectory, selected.Name()+".json")
-	loadPath := defaultConfigPath
-	if c.ConfigPathOverride != "" {
-		loadPath = c.ConfigPathOverride
-	}
-
-	if _, statErr := os.Stat(loadPath); statErr == nil {
-		// In interactive mode a load failure is non-fatal — the user
-		// just sees defaults. With an explicit override we surface the
-		// error so the operator notices a busted config instead of
-		// silently running with whatever defaults the schema provides.
-		if err := schema.LoadJSON(loadPath); err != nil && c.ConfigPathOverride != "" {
-			return nil, fmt.Errorf("load config %s: %w", loadPath, err)
+	if _, statErr := os.Stat(c.ConfigPath); statErr == nil {
+		if err := schema.LoadJSON(c.ConfigPath); err != nil && c.SkipEdit {
+			return nil, fmt.Errorf("load config %s: %w", c.ConfigPath, err)
 		}
-	} else if c.ConfigPathOverride != "" {
-		return nil, fmt.Errorf("config file not found: %s", loadPath)
+	} else if c.SkipEdit {
+		return nil, fmt.Errorf("config file not found: %s (run once interactively, or create it)", c.ConfigPath)
 	}
 
-	if c.ConfigPathOverride == "" {
+	if c.SkipEdit {
+		if errs := schema.Validate(c.FilesDirectory); len(errs) > 0 {
+			return nil, fmt.Errorf("config %s is invalid: %s", c.ConfigPath, errs.Error())
+		}
+	} else {
 		if c.Renderer == nil {
 			return nil, fmt.Errorf("configurator: Renderer is nil (interactive edit required)")
 		}
 		if err := c.Renderer.EditConfig(schema, c.FilesDirectory); err != nil {
 			return nil, fmt.Errorf("edit config: %w", err)
 		}
-		if err := schema.SaveJSON(defaultConfigPath); err != nil {
-			return nil, fmt.Errorf("save config: %w", err)
+		if err := os.MkdirAll(filepath.Dir(c.ConfigPath), 0o755); err != nil {
+			return nil, fmt.Errorf("mkdir config dir: %w", err)
 		}
-	} else {
-		// Non-interactive: the supplied config must already validate.
-		if errs := schema.Validate(c.FilesDirectory); len(errs) > 0 {
-			return nil, fmt.Errorf("config %s is invalid: %s", loadPath, errs.Error())
+		if err := schema.SaveJSON(c.ConfigPath); err != nil {
+			return nil, fmt.Errorf("save config: %w", err)
 		}
 	}
 
-	projectName, err := c.pickProjectName()
+	runName, err := c.pickRunName()
 	if err != nil {
 		return nil, err
 	}
 
 	return &Result{
-		Module:      selected,
-		ProjectName: projectName,
+		Module:  selected,
+		RunName: runName,
 	}, nil
 }
 
-// pickModule returns the preselected module if PreselectedModuleName
-// is set, auto-selects when exactly one module is registered, and
-// otherwise delegates to the renderer. Errors from name lookups are
-// explicit so the caller can distinguish "user canceled" from "you
-// asked for a module that doesn't exist".
 func (c *Configurator) pickModule(modules []module.Module) (module.Module, error) {
 	if c.PreselectedModuleName != "" {
 		for _, m := range modules {
@@ -145,7 +131,6 @@ func (c *Configurator) pickModule(modules []module.Module) (module.Module, error
 		return nil, fmt.Errorf("unknown module %q (available: %v)", c.PreselectedModuleName, available)
 	}
 
-	// Single-module repos (the browserscale-kit default) skip the picker.
 	if len(modules) == 1 {
 		return modules[0], nil
 	}
@@ -163,23 +148,24 @@ func (c *Configurator) pickModule(modules []module.Module) (module.Module, error
 	return selected, nil
 }
 
-// pickProjectName uses PreselectedTaskName if set (validating it
-// against the same rules as the interactive prompt) and otherwise
-// asks the renderer.
-func (c *Configurator) pickProjectName() (string, error) {
-	if c.PreselectedTaskName != "" {
-		if err := ValidateProjectName(c.TasksDirectory, c.PreselectedTaskName); err != nil {
-			return "", fmt.Errorf("invalid --task: %w", err)
+func (c *Configurator) pickRunName() (string, error) {
+	if c.PreselectedRunName != "" {
+		if err := ValidateRunName(c.PreselectedRunName); err != nil {
+			return "", fmt.Errorf("invalid -run: %w", err)
 		}
-		return c.PreselectedTaskName, nil
+		return c.PreselectedRunName, nil
+	}
+
+	if c.SkipEdit {
+		return time.Now().Format("2006-01-02_150405"), nil
 	}
 
 	if c.Renderer == nil {
-		return "", fmt.Errorf("configurator: Renderer is nil (interactive task naming required)")
+		return "", fmt.Errorf("configurator: Renderer is nil (interactive run naming required)")
 	}
-	projectName, err := c.Renderer.PromptProjectName(c.TasksDirectory)
+	runName, err := c.Renderer.PromptRunName(c.RunsDirectory)
 	if err != nil {
-		return "", fmt.Errorf("prompt project name: %w", err)
+		return "", fmt.Errorf("prompt run name: %w", err)
 	}
-	return projectName, nil
+	return runName, nil
 }

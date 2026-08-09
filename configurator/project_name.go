@@ -2,18 +2,15 @@ package configurator
 
 import (
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 )
 
-// invalidProjectNameChars catches anything Windows / POSIX file systems
+// invalidRunNameChars catches anything Windows / POSIX file systems
 // reject in a folder name. Kept here (rather than in huh_renderer.go)
 // so non-interactive callers (CLI args, future GUI) can validate
 // against the same rules without going through the renderer.
-var invalidProjectNameChars = regexp.MustCompile(`[<>:"|?*\\/]`)
+var invalidRunNameChars = regexp.MustCompile(`[<>:"|?*\\/]`)
 
 var reservedWindowsNames = map[string]struct{}{
 	"CON": {}, "PRN": {}, "AUX": {}, "NUL": {},
@@ -23,24 +20,26 @@ var reservedWindowsNames = map[string]struct{}{
 	"LPT6": {}, "LPT7": {}, "LPT8": {}, "LPT9": {},
 }
 
-// ValidateProjectName checks name against the same rules the huh
-// renderer enforces inline: non-empty, no forbidden characters, not a
-// reserved Windows device name, and not colliding with an existing
-// folder under tasksDirectory. The returned error messages are
-// user-facing.
-func ValidateProjectName(tasksDirectory, name string) error {
+// ValidateRunName checks name against filesystem-safe rules. Existing
+// run folders are allowed so a named run can be resumed and append
+// outputs. The returned error messages are user-facing.
+func ValidateRunName(name string) error {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
-		return errors.New("project name cannot be empty")
+		return errors.New("run name cannot be empty")
 	}
-	if invalidProjectNameChars.MatchString(trimmed) {
+	if invalidRunNameChars.MatchString(trimmed) {
 		return errors.New(`name contains forbidden characters (< > : " | ? * \ /)`)
 	}
 	if _, ok := reservedWindowsNames[strings.ToUpper(trimmed)]; ok {
 		return errors.New("name is a reserved Windows name")
 	}
-	if _, err := os.Stat(filepath.Join(tasksDirectory, trimmed)); err == nil {
-		return fmt.Errorf("a project named %q already exists", trimmed)
-	}
 	return nil
+}
+
+// ValidateProjectName is a deprecated alias for ValidateRunName that
+// ignores tasksDirectory. Prefer ValidateRunName.
+func ValidateProjectName(tasksDirectory, name string) error {
+	_ = tasksDirectory
+	return ValidateRunName(name)
 }

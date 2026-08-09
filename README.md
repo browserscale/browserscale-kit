@@ -103,8 +103,9 @@ func main() {
 ```
 
 ```bash
-go run .          # opens the configurator: fill the API key, name the task, run
-go run . -h       # -module / -task / -config / -data flags for headless runs
+go run .          # opens the configurator: fill the API key, name the run, go
+go run . -yes     # headless: use data/config.json, auto timestamp under runs/
+go run . -h       # -module / -run / -yes / -data / -runs
 ```
 
 ## Packages
@@ -114,7 +115,7 @@ go run . -h       # -module / -task / -config / -data flags for headless runs
 | **module** | `…/browserscale-kit/module` | The `Module` contract every bot implements, plus the `Env` of runtime services. |
 | **harness** | `…/browserscale-kit/harness` | One-call program wiring: flags → dirs → configurator → store → `Run`, with Ctrl-C cancellation. |
 | **form** | `…/browserscale-kit/form` | Fluent, type-safe config DSL that renders to prompts, JSON, and (later) a web GUI. |
-| **configurator** | `…/browserscale-kit/configurator` | Flow control for the config phase: pick module → load → edit → validate → save → name the task. |
+| **configurator** | `…/browserscale-kit/configurator` | Flow control for the config phase: pick module → load → edit → validate → save → name the run. |
 | **store** | `…/browserscale-kit/store` | Process-wide persistent key/value store (SQLite/WAL), namespaced, with atomic typed updates. |
 | **input** | `…/browserscale-kit/input` | Error-honest list-file readers, a delimited/CSV parser, and a thread-safe work `Queue[T]`. |
 | **proxy** | `…/browserscale-kit/proxy` | Parse every common proxy format, hand them out via a `Pool`, and liveness-check them. |
@@ -135,7 +136,7 @@ A module is a self-contained automation unit with a typed config and one entry p
 
 ```go
 type Module interface {
-	Name() string              // canonical id, e.g. "example_bot" (JSON filename + routing key)
+	Name() string              // canonical id, e.g. "example_bot" (routing key)
 	Version() string           // semver of the module implementation
 	Schema() *form.Schema      // config form bound to the typed struct (same instance every call)
 	Run(ctx context.Context, env Env) error
@@ -146,11 +147,11 @@ type Module interface {
 
 | Field | Type | Purpose |
 | --- | --- | --- |
-| `FilesDirectory` | `string` | Absolute dir holding operator-supplied input files. Resolve with `filepath.Join(env.FilesDirectory, cfg.SomeFile)`. |
-| `Output` | `OutputFunc` | `Output(file, line, mode)` streams a result line to the task's output dir (`"w"`/`"write"` truncates, `"a"`/`"append"` appends). Writes are serialized. |
+| `FilesDirectory` | `string` | Absolute `data/` directory (`config.json`, input files, `store.db`). Resolve with `filepath.Join(env.FilesDirectory, cfg.SomeFile)`. |
+| `Output` | `OutputFunc` | `Output(file, line, mode)` streams a result line to `runs/<run>/` (`"w"`/`"write"` truncates, `"a"`/`"append"` appends). Writes are serialized. |
 | `Status` | `StatusFunc` | Updates the host's status line (terminal title). |
 | `Logger` | `*logger.Logger` | Parent logger to derive module-scoped children from. |
-| `Store` | `*store.Store` | Process-wide persistent store; carve out `env.Store.Namespace(m.Name())`. |
+| `Store` | `*store.Store` | Process-wide persistent store at `data/store.db`; carve out `env.Store.Namespace(m.Name())`. |
 
 Cancellation is delivered through `ctx` (the host cancels on SIGINT/SIGTERM). Honour it in your worker loops and return when done.
 
@@ -163,21 +164,32 @@ func harness.Run(appName string, modules []module.Module) error
 `Run` is the whole `main()`. It:
 
 1. Parses launch flags (see below).
-2. Creates the working directory layout under `-data` (default `./data`): `Configs/`, `Files/`, `Tasks/`, `Stores/`.
-3. Runs the `configurator` (auto-skips the picker when only one module is registered).
-4. Opens the persistent store at `Stores/<appName>.db`.
-5. Builds the `module.Env` and runs the selected module until it finishes or the process is interrupted (Ctrl-C / SIGTERM cancels `ctx`).
+2. Ensures `data/` and `runs/` exist.
+3. Runs the `configurator` (loads/saves `data/config.json`; auto-skips the module picker when only one module is registered).
+4. Opens the persistent store at `data/store.db`.
+5. Builds the `module.Env` (inputs from `data/`, outputs to `runs/<run>/`) and runs the module until it finishes or the process is interrupted (Ctrl-C / SIGTERM cancels `ctx`).
+
+Layout:
+
+```text
+data/config.json     # single config
+data/accounts.csv    # operator input files (flat)
+data/proxies.txt
+data/store.db        # persistent KV
+runs/2026-08-09_…/   # one folder per run (outputs)
+```
 
 It returns `nil` on a clean finish **and** on user cancellation (`harness.ErrCanceled` is re-exported if you want to distinguish).
 
-Launch flags (also available standalone via `harness.ParseLaunchArgs`) let a run skip interactive setup — handy for CI and agents:
+Launch flags (also available standalone via `harness.ParseLaunchArgs`) — handy for CI and agents:
 
 | Flag | Meaning |
 | --- | --- |
 | `-module NAME` | Module to launch (only needed when several are registered). |
-| `-task NAME` | Task / project folder name under `Tasks/`; empty prompts. |
-| `-config PATH` | Config JSON to load (absolute, relative, or a bare name resolved against `Configs/`). Skips the editor and never writes back. |
-| `-data DIR` | Working-directory root (default `./data`). |
+| `-run NAME` | Run folder under `runs/`; empty prompts interactively, or a timestamp with `-yes`. |
+| `-yes` | Non-interactive: require `data/config.json`, skip the editor; auto-name the run if `-run` is empty. |
+| `-data DIR` | Config + inputs + store (default `./data`). |
+| `-runs DIR` | Per-run output root (default `./runs`). |
 
 ### form — the config DSL
 
@@ -208,7 +220,7 @@ schema := f.Build()
 
 ### configurator — the config phase
 
-Pure flow control (no UI of its own — UI lives behind a `Renderer`): pick module → apply defaults → load JSON → edit → validate → save → name the task. `harness` uses the bundled `NewHuhRenderer()` (a [Charm huh](https://github.com/charmbracelet/huh) TUI). Non-interactive overrides (`PreselectedModuleName`, `ConfigPathOverride`, `PreselectedTaskName`) skip the matching step, so you can run fully headless.
+Pure flow control (no UI of its own — UI lives behind a `Renderer`): pick module → apply defaults → load `data/config.json` → edit → validate → save → name the run. `harness` uses the bundled `NewHuhRenderer()` (a [Charm huh](https://github.com/charmbracelet/huh) TUI). Non-interactive mode (`SkipEdit` / `-yes`) skips the editor and auto-picks a timestamp run name when `-run` is empty.
 
 ### store — persistent, multi-process key/value
 
