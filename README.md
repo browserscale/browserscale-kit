@@ -23,7 +23,7 @@ The [`browserscale-go`](https://github.com/browserscale/browserscale-go) SDK dri
 
 `browserscale-kit` is that surrounding layer. Drop it next to the SDK and a module shrinks to one method — `doTask(ctx, browser)` — while the kit handles setup, config, persistence, and I/O. It is a **convenience, not a framework**: every package is usable à la carte, and a module author who wants different wiring can ignore `harness` and call the pieces directly.
 
-> Fastest path: don't wire this by hand. Run [`browserscale init`](https://github.com/browserscale/browserscale-cli) and you get a runnable module that already imports the kit, with an `AGENTS.md` + offline docs that prime an AI coding agent to fill in the flow.
+> Fastest path: don't wire this by hand. Run [`browserscale init`](https://github.com/browserscale/browserscale) and you get a runnable module that already imports the kit, with an `AGENTS.md` + offline docs that prime an AI coding agent to fill in the flow.
 
 ## Install
 
@@ -316,7 +316,7 @@ code, err := f.FetchCode(ctx,
 | Project | Role |
 | --- | --- |
 | [**browserscale-go**](https://github.com/browserscale/browserscale-go) | The SDK — rent and drive a real cloud Chromium session (navigate, wait, click, fill, read, evaluate, captcha, cookies…). |
-| [**browserscale-cli**](https://github.com/browserscale/browserscale-cli) | `browserscale init` — scaffold a runnable module that already imports this kit and the SDK, with agent-ready docs. |
+| [**browserscale**](https://github.com/browserscale/browserscale) | The CLI: `browserscale init` — scaffold a runnable module that already imports this kit and the SDK, with agent-ready docs. |
 | **browserscale-kit** (you are here) | The toolkit *around* the browser: config, store, queues, proxies, logging, mail. |
 
 Also available: [**browserscale-ts**](https://github.com/browserscale/browserscale-ts), the TypeScript SDK.
