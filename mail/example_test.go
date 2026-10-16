@@ -8,7 +8,7 @@ import (
 )
 
 // triggerSend stands in for the browser action that makes the site send its
-// verification email, e.g. browser.Click(ctx, browserscale.CSS("#send-code")).
+// verification email, e.g. page.Click(ctx, browserscale.CSS("#send-code")).
 func triggerSend() error { return nil }
 
 // ExampleCodeFetcher_FetchCode shows the mailTime idiom: capture the timestamp

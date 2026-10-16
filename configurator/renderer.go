@@ -1,18 +1,13 @@
 package configurator
 
-import (
-	"github.com/browserscale/browserscale-kit/form"
-	"github.com/browserscale/browserscale-kit/module"
-)
+import "github.com/browserscale/browserscale-kit/form"
 
-// Renderer is the UI layer the Configurator delegates to. Splitting this
-// out of the Configurator lets us swap CLI back-ends (huh today, a
-// bubbletea-native renderer or a JSON-driven GUI tomorrow) without
-// changing how modules expose their schemas or how task setup works.
+// Renderer is the UI layer the Configurator delegates to. The terminal uses
+// HuhRenderer; browserscale Studio draws the same schema from its JSON Schema
+// export and writes config.json itself.
 type Renderer interface {
-	// SelectModule asks the user to choose one module from the list.
-	// Returns nil if the user cancels.
-	SelectModule(modules []module.Module) (module.Module, error)
+	// Greet is called once before the first prompt.
+	Greet(title string)
 
 	// EditConfig presents the form for editing. Each call mutates the
 	// underlying typed cfg via the schema's bound pointers. The

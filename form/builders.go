@@ -3,6 +3,7 @@ package form
 import (
 	"fmt"
 	"math"
+	"strings"
 )
 
 // Each typed FieldBuilder wraps a *Field and the parent *Form (so it can
@@ -38,6 +39,13 @@ func (b *StringField) Label(s string) *StringField   { b.f.Label = s; return b }
 func (b *StringField) Help(s string) *StringField    { b.f.Help = s; return b }
 func (b *StringField) Required() *StringField        { b.f.Required = true; return b }
 func (b *StringField) Default(v string) *StringField { b.f.Default = v; return b }
+
+// Secret marks the value as one to show masked, such as a password or a
+// key. It's stored in the config file like any other.
+func (b *StringField) Secret() *StringField { b.f.Secret = true; return b }
+
+// Placeholder is a hint shown while the field is empty.
+func (b *StringField) Placeholder(s string) *StringField { b.f.Placeholder = s; return b }
 func (b *StringField) ShowWhen(p func() bool) *StringField {
 	b.f.visible = p
 	return b
@@ -137,6 +145,7 @@ func (b *IntField) Validate(fn func(int) error) *IntField {
 // Field that runs Min, Max, then the user validator (whichever are
 // configured). Called whenever any of those change.
 func (b *IntField) rebuild() {
+	b.f.Min, b.f.Max = bound(b.min), bound(b.max)
 	if b.min == nil && b.max == nil && b.userFunc == nil {
 		b.f.validate = nil
 		return
@@ -236,6 +245,7 @@ func (b *FloatField) Validate(fn func(float64) error) *FloatField {
 }
 
 func (b *FloatField) rebuild() {
+	b.f.Min, b.f.Max = bound(b.min), bound(b.max)
 	if b.min == nil && b.max == nil && b.userFunc == nil {
 		b.f.validate = nil
 		return
@@ -434,6 +444,69 @@ func (b *FileField) declarative(field, op string, value any) *FileField {
 	return b
 }
 
+// ---------------- Proxies ----------------
+
+type ProxiesField struct {
+	f    *Field
+	form *Form
+}
+
+func newProxiesField(form *Form, name string, ptr *string) *ProxiesField {
+	b := newFileField(form, name, ptr)
+	b.f.FileTag = TagProxies
+	b.f.Proxies = &ProxyRule{}
+	return &ProxiesField{f: b.f, form: form}
+}
+
+func (b *ProxiesField) Label(s string) *ProxiesField   { b.f.Label = s; return b }
+func (b *ProxiesField) Help(s string) *ProxiesField    { b.f.Help = s; return b }
+func (b *ProxiesField) Required() *ProxiesField        { b.f.Required = true; return b }
+func (b *ProxiesField) Default(v string) *ProxiesField { b.f.Default = v; return b }
+
+// Kinds limits the setting to these kinds of source (proxy.KindGateway,
+// proxy.KindManaged, ...); others are turned down.
+func (b *ProxiesField) Kinds(kinds ...string) *ProxiesField {
+	b.f.Proxies.Kinds = kinds
+	return b
+}
+
+// Fresh says every job's browser needs a new exit address, e.g. for a
+// signup that a reused address gets blocked; a setting that can't give one
+// gets a note.
+func (b *ProxiesField) Fresh() *ProxiesField { b.f.Proxies.Address = AddressFresh; return b }
+
+// Keeps says an account keeps its address from job to job (see
+// kit.Job.UseProxy); a setting that changes it gets a note.
+func (b *ProxiesField) Keeps() *ProxiesField { b.f.Proxies.Address = AddressKeep; return b }
+
+// Country is the exit country the site needs, e.g. "de". Managed proxies
+// get it, and a source asking for another gets a note.
+func (b *ProxiesField) Country(cc string) *ProxiesField {
+	b.f.Proxies.Country = strings.ToLower(cc)
+	return b
+}
+
+func (b *ProxiesField) ShowWhen(p func() bool) *ProxiesField { b.f.visible = p; return b }
+func (b *ProxiesField) ShowWhenEq(field string, value any) *ProxiesField {
+	return b.declarative(field, "eq", value)
+}
+func (b *ProxiesField) ShowWhenIn(field string, values ...any) *ProxiesField {
+	return b.declarative(field, "in", values)
+}
+func (b *ProxiesField) ShowWhenTruthy(field string) *ProxiesField {
+	return b.declarative(field, "truthy", nil)
+}
+func (b *ProxiesField) Validate(fn func(string) error) *ProxiesField {
+	b.f.validate = func(v any) error { return fn(v.(string)) }
+	return b
+}
+func (b *ProxiesField) declarative(field, op string, value any) *ProxiesField {
+	vw := &VisibleWhen{Field: field, Op: op, Value: value}
+	b.f.visibleWhen = vw
+	b.f.visible = b.form.compileVisibleWhen(vw)
+	return b
+}
+
 // ---------------- StringList ----------------
 
 type StringListField struct {
@@ -495,6 +568,14 @@ func (b *StringListField) declarative(field, op string, value any) *StringListFi
 }
 
 // ---------------- conversion helpers ----------------
+
+func bound[T int | float64](v *T) *float64 {
+	if v == nil {
+		return nil
+	}
+	f := float64(*v)
+	return &f
+}
 
 // toInt converts JSON-decoded values (which arrive as float64) and plain ints
 // to int, with bounds checking against the platform int range.

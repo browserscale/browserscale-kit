@@ -1,332 +1,86 @@
-<div align="center">
-
 # browserscale-kit
 
-**The batteries-included Go toolkit for building browser-automation bots on [browserscale](https://browserscale.cloud).**
-
-Config forms, an interactive configurator, a multi-process key/value store, work queues, proxy parsing, a tree logger, and an IMAP OTP fetcher — everything a real automation module needs *around* the browser, so you only write the browser flow.
-
 [![Go Reference](https://pkg.go.dev/badge/github.com/browserscale/browserscale-kit.svg)](https://pkg.go.dev/github.com/browserscale/browserscale-kit)
-![Go](https://img.shields.io/badge/go-1.25-00ADD8?logo=go&logoColor=white)
-![Pure Go](https://img.shields.io/badge/cgo-free-success)
-![License](https://img.shields.io/badge/license-MIT-blue)
 
-[Install](#install) · [Quickstart](#quickstart) · [Packages](#packages) · [Ecosystem](#ecosystem)
+The Go framework browserscale bots run on. It reads the settings, hands the jobs to threads, rents a browser for a job when it uses one, through the configured proxies, and reports every step and end as it happens. The bot itself only says what one job does in the browser, and what each way it can end means.
 
-</div>
+Bots written in [browserscale studio](https://github.com/browserscale/browserscale) are built on it; it works just as well on its own, next to [browserscale-go](https://github.com/browserscale/browserscale-go).
 
----
-
-## Why
-
-The [`browserscale-go`](https://github.com/browserscale/browserscale-go) SDK drives a real cloud Chromium session. But a production bot is never *just* the browser flow — it needs config the operator can edit, persistent per-account state, proxy lists, work queues across threads, structured logging, and often a verification-code inbox.
-
-`browserscale-kit` is that surrounding layer. Drop it next to the SDK and a module shrinks to one method — `doTask(ctx, browser)` — while the kit handles setup, config, persistence, and I/O. It is a **convenience, not a framework**: every package is usable à la carte, and a module author who wants different wiring can ignore `harness` and call the pieces directly.
-
-> Fastest path: don't wire this by hand. Run [`browserscale init`](https://github.com/browserscale/browserscale) and you get a runnable module that already imports the kit, with an `AGENTS.md` + offline docs that prime an AI coding agent to fill in the flow.
-
-## Install
-
-```bash
+```sh
 go get github.com/browserscale/browserscale-kit@latest
 ```
 
-Requires **Go 1.25+**. Pure Go — no CGO, no system libraries, no SQLite DLL (the store uses [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite)), so `go build` yields a single static binary on every OS.
-
-## Quickstart
-
-A complete, runnable single-file module. The `harness` parses flags, lays out the working directory, runs the interactive configurator, opens the store, and calls `Run` — you own everything inside `Run`.
+## A bot
 
 ```go
 package main
 
 import (
-	"context"
-	"log"
+	"iter"
 
-	browserscale "github.com/browserscale/browserscale-go"
+	kit "github.com/browserscale/browserscale-kit"
 	"github.com/browserscale/browserscale-kit/form"
-	"github.com/browserscale/browserscale-kit/harness"
-	"github.com/browserscale/browserscale-kit/logger"
-	"github.com/browserscale/browserscale-kit/module"
+	"github.com/browserscale/browserscale-kit/proxy"
 )
 
-type Config struct {
-	APIKey  string `json:"apiKey"`
-	Threads int    `json:"threads"`
-}
-
-type Bot struct {
-	cfg    *Config
-	schema *form.Schema
-}
-
-func (b *Bot) Name() string    { return "hello_bot" }
-func (b *Bot) Version() string { return "1.0.0" }
-
-// Schema binds a typed config struct to an interactive form. It MUST return
-// the same instance on every call so the configurator's edits reach Run.
-func (b *Bot) Schema() *form.Schema {
-	if b.schema != nil {
-		return b.schema
-	}
-	b.cfg = &Config{}
-	f := form.New(b.Name(), "Hello Bot", b.cfg)
-	f.String("apiKey", &b.cfg.APIKey).Label("browserscale API key").Required()
-	f.Int("threads", &b.cfg.Threads).Label("Threads").Default(4).Min(1)
-	b.schema = f.Build()
-	return b.schema
-}
-
-func (b *Bot) Run(ctx context.Context, env module.Env) error {
-	l := logger.NewLogger("[hello_bot]", env.Logger)
-
-	bc := browserscale.NewBrowserConfig(b.cfg.APIKey, 120, "", 0, "", "")
-	browser, err := browserscale.RentBrowser(ctx, bc)
-	if err != nil {
-		return err
-	}
-	defer browser.Close()
-
-	if _, err := browser.Navigate(ctx, "https://playground.browsercloud.cloud", 30000); err != nil {
-		return err
-	}
-	l.Success("done")
-	return nil
+type Settings struct {
+	Accounts int    `json:"accounts"`
+	Threads  int    `json:"threads"`
+	Proxies  string `json:"proxies"`
 }
 
 func main() {
-	if err := harness.Run("hello_bot", []module.Module{&Bot{}}); err != nil {
-		log.Fatal(err)
-	}
+	kit.Main(kit.Bot[Settings, Account]{
+		Name: "outlook-register",
+		Settings: func(f *form.Form, s *Settings) {
+			f.Int("accounts", &s.Accounts).Label("Accounts to create").Default(1).Min(1)
+			f.Int("threads", &s.Threads).Label("Threads").Help("How many signups run at once").Default(1).Min(1)
+			f.Proxies("proxies", &s.Proxies).Label("Proxies").Kinds(proxy.KindGateway, proxy.KindManaged).Fresh()
+		},
+		Jobs:    func(r *kit.Run, s *Settings) iter.Seq[Account] { return kit.Until(r, s.Accounts, newAccount, "registered") },
+		Threads: func(s *Settings) int { return s.Threads },
+		Job:     register,
+		Ends: kit.Ends{
+			"registered":     kit.Good,
+			"phone_required": kit.Neutral,
+			"blocked":        kit.Bad.ChangeProxy(),
+		},
+	})
 }
 ```
 
-```bash
-go run .          # opens the configurator: fill the API key, name the run, go
-go run . -yes     # headless: use data/config.json, auto timestamp under runs/
-go run . -h       # -module / -run / -yes / -data / -runs
-```
+`register` is the job, `func(j *kit.Job, s *Settings, a Account) error`: it opens the job's page with `j.Page()`, goes through the signup, and ends the job by one of the names in `Ends` with `j.End`, or returns an error. Everything around it is the kit's.
+
+## What it does for you
+
+- **Settings.** A typed form (`form`) that renders as terminal prompts, as JSON and as the settings screen in Studio, saved to `data/config.json`.
+- **Jobs and threads.** `Times`, `Until`, `Lines` and `Rows` for a number of jobs or an input file, `Forever`, `Every` and `At` for a run that keeps going, `Queue` for jobs other jobs hand over. Each job gets its own browser the first time it asks for one.
+- **Programs.** Several tasks side by side in one run, such as signups next to a task that watches the mailbox, handing each other work with `Run.Push` and `Run.Post`.
+- **Steps.** A job can be written as steps with `Job.Flow`; the kit reports which step each job is in, and a run can start at one (`-from`) or stop after one (`-until`).
+- **Errors.** Trouble with the browser or the proxy is retried with a fresh browser, and another proxy when the proxy was at fault. Outcomes of the site end the job by the bot's own names. Anything else ends it as `error` with its step and a screenshot, and stops the run when the same step keeps failing.
+- **Proxies.** Lists, provider gateways, static addresses and mobile proxies, or browserscale's managed proxies; http and socks5, with MASQUE for HTTP/3. A failed proxy rests or rotates according to its kind (`proxy`).
+- **Store.** What jobs keep across runs, in `data/store.db`, with atomic updates that hold across processes (`store`).
+- **Runs.** Every run writes its events, its settings, one row per job and what jobs saved to `runs/<run>/`.
+- **Mail.** An IMAP code fetcher for one-time verification codes (`mail`).
+
+The package documentation (`go doc github.com/browserscale/browserscale-kit`) covers all of it, including the flags for developing a bot.
 
 ## Packages
 
-| Package | Import path | What it does |
-| --- | --- | --- |
-| **module** | `…/browserscale-kit/module` | The `Module` contract every bot implements, plus the `Env` of runtime services. |
-| **harness** | `…/browserscale-kit/harness` | One-call program wiring: flags → dirs → configurator → store → `Run`, with Ctrl-C cancellation. |
-| **form** | `…/browserscale-kit/form` | Fluent, type-safe config DSL that renders to prompts, JSON, and (later) a web GUI. |
-| **configurator** | `…/browserscale-kit/configurator` | Flow control for the config phase: pick module → load → edit → validate → save → name the run. |
-| **store** | `…/browserscale-kit/store` | Process-wide persistent key/value store (SQLite/WAL), namespaced, with atomic typed updates. |
-| **input** | `…/browserscale-kit/input` | Error-honest list-file readers, a delimited/CSV parser, and a thread-safe work `Queue[T]`. |
-| **proxy** | `…/browserscale-kit/proxy` | Parse every common proxy format, hand them out via a `Pool`, and liveness-check them. |
-| **logger** | `…/browserscale-kit/logger` | Timestamped, colored, prefix-scoped tree logger that can tee to a file. |
-| **mail** | `…/browserscale-kit/mail` | Long-lived IMAP `CodeFetcher` for pulling one-time verification codes out of a mailbox. |
+| Package | |
+|---|---|
+| `kit` | Bots, programs, jobs, runs, ends, proxies and events |
+| `form` | The settings form |
+| `configurator` | Asking for and saving the settings |
+| `proxy` | Proxy formats, sources and the pool |
+| `store` | The persistent key/value store |
+| `input` | List and delimited file readers, and a work queue |
+| `mail` | Verification codes from a mailbox |
 
-Import them together:
+## Earlier versions
 
-```go
-import "github.com/browserscale/browserscale-kit/{form,store,input,proxy,mail,logger,module,harness}"
-```
-
----
-
-### module — the contract
-
-A module is a self-contained automation unit with a typed config and one entry point. There is no `Initialize`/`Stop` split — teardown is a plain `defer` inside `Run`.
-
-```go
-type Module interface {
-	Name() string              // canonical id, e.g. "example_bot" (routing key)
-	Version() string           // semver of the module implementation
-	Schema() *form.Schema      // config form bound to the typed struct (same instance every call)
-	Run(ctx context.Context, env Env) error
-}
-```
-
-`Run` receives an `Env` of runtime services (any field may be zero in a minimal host — nil-check optional ones):
-
-| Field | Type | Purpose |
-| --- | --- | --- |
-| `FilesDirectory` | `string` | Absolute `data/` directory (`config.json`, input files, `store.db`). Resolve with `filepath.Join(env.FilesDirectory, cfg.SomeFile)`. |
-| `Output` | `OutputFunc` | `Output(file, line, mode)` streams a result line to `runs/<run>/` (`"w"`/`"write"` truncates, `"a"`/`"append"` appends). Writes are serialized. |
-| `Status` | `StatusFunc` | Updates the host's status line (terminal title). |
-| `Logger` | `*logger.Logger` | Parent logger to derive module-scoped children from. |
-| `Store` | `*store.Store` | Process-wide persistent store at `data/store.db`; carve out `env.Store.Namespace(m.Name())`. |
-
-Cancellation is delivered through `ctx` (the host cancels on SIGINT/SIGTERM). Honour it in your worker loops and return when done.
-
-### harness — batteries-included wiring
-
-```go
-func harness.Run(appName string, modules []module.Module) error
-```
-
-`Run` is the whole `main()`. It:
-
-1. Parses launch flags (see below).
-2. Ensures `data/` and `runs/` exist.
-3. Runs the `configurator` (loads/saves `data/config.json`; auto-skips the module picker when only one module is registered).
-4. Opens the persistent store at `data/store.db`.
-5. Builds the `module.Env` (inputs from `data/`, outputs to `runs/<run>/`) and runs the module until it finishes or the process is interrupted (Ctrl-C / SIGTERM cancels `ctx`).
-
-Layout:
-
-```text
-data/config.json     # single config
-data/accounts.csv    # operator input files (flat)
-data/proxies.txt
-data/store.db        # persistent KV
-runs/2026-08-09_…/   # one folder per run (outputs)
-```
-
-It returns `nil` on a clean finish **and** on user cancellation (`harness.ErrCanceled` is re-exported if you want to distinguish).
-
-Launch flags (also available standalone via `harness.ParseLaunchArgs`) — handy for CI and agents:
-
-| Flag | Meaning |
-| --- | --- |
-| `-module NAME` | Module to launch (only needed when several are registered). |
-| `-run NAME` | Run folder under `runs/`; empty prompts interactively, or a timestamp with `-yes`. |
-| `-yes` | Non-interactive: require `data/config.json`, skip the editor; auto-name the run if `-run` is empty. |
-| `-data DIR` | Config + inputs + store (default `./data`). |
-| `-runs DIR` | Per-run output root (default `./runs`). |
-
-### form — the config DSL
-
-Bind a typed struct to a form with a fluent builder. The resulting `Schema` is consumed by the configurator for prompts, persisted as JSON, and can be exported as JSON Schema for a future GUI.
-
-```go
-cfg := &MyConfig{}
-f := form.New("my_module", "My Module", cfg)
-f.Int("threads", &cfg.Threads).Label("Threads").Required().Default(1).Min(1)
-f.Bool("useProxies", &cfg.UseProxies).Label("Use Proxies").Default(false)
-f.File("proxiesFile", &cfg.ProxiesFile).
-	Label("Proxies File").
-	Tag(form.TagProxies).           // validate: file parses to ≥1 proxy
-	ShowWhenTruthy("useProxies").   // only shown when useProxies is true
-	Required()
-f.Select("region", &cfg.Region).Label("Region").
-	Option("us", "United States").Option("de", "Germany").Default("us")
-schema := f.Build()
-```
-
-**Field starters** on `*Form` (each returns a typed builder): `String`, `Int`, `Float`, `Bool`, `Select`, `File`, `StringList`.
-
-**Builder methods** (chainable, common to all): `Label`, `Help`, `Required`, `Default(v)`, `Validate(fn)`, and conditional visibility — `ShowWhen(func() bool)`, `ShowWhenEq(field, value)`, `ShowWhenIn(field, values…)`, `ShowWhenTruthy(field)`. Kind-specific: `Min`/`Max` (`Int`, `Float`), `Option(value, label)` (`Select`), `Tag(tag)` + `ValidateFile(fn)` (`File`).
-
-**File tags** drive validation: `TagRaw` (exists), `TagLines` (≥1 non-empty line), `TagLinesPath`, `TagProxies` (≥1 parseable proxy).
-
-**Schema** operations: `Build()`, `Validate(filesDir) ValidationErrors`, `ApplyDefaults()`, `LoadJSON`/`LoadMap`, `SaveJSON`/`ToMap`, `VisibleFields()`, `Field(name)`. Hidden fields keep their values on save, so toggling a controlling field back on never loses data.
-
-### configurator — the config phase
-
-Pure flow control (no UI of its own — UI lives behind a `Renderer`): pick module → apply defaults → load `data/config.json` → edit → validate → save → name the run. `harness` uses the bundled `NewHuhRenderer()` (a [Charm huh](https://github.com/charmbracelet/huh) TUI). Non-interactive mode (`SkipEdit` / `-yes`) skips the editor and auto-picks a timestamp run name when `-run` is empty.
-
-### store — persistent, multi-process key/value
-
-SQLite in WAL mode via pure-Go `modernc.org/sqlite`: many concurrent readers across processes, one writer at a time. Foreign / corrupt DB files are moved aside and recreated transparently.
-
-```go
-s, _ := store.Open(filepath.Join(root, "state.db"))
-defer s.Close()
-
-ns := s.Namespace("example_bot")              // isolated partition; keys never collide across namespaces
-sessions := store.NewJSON[Session](ns)        // typed JSON codec on top
-
-// Atomic read-modify-write in a BEGIN IMMEDIATE tx — safe across goroutines AND processes.
-sessions.Update("user@example.com", func(cur Session, exists bool) (Session, error) {
-	cur.Status = "logged_in"
-	return cur, nil
-})
-```
-
-- **`*Store`**: `Open(path)`, `Close`, `Path`, `Namespace(name)`.
-- **`*Namespace`** (raw bytes): `Get`, `Put`, `Delete`, `Update`, `Keys(prefix)`, `ForEach(prefix, fn)`, `Count`, `DropNamespace`.
-- **`*JSON[T]`** (typed): `NewJSON[T](ns)` then `Get`, `Put`, `Update`, `Delete`, `Keys`, `ForEach`.
-
-`Get` returns `(value, ok, err)` — "present with empty value" is distinct from "absent". Return `(nil, nil)` from an `Update` fn to delete a key.
-
-### input — files & work queues
-
-Error-honest replacements for the usual "read a list file" grab-bag: they return errors instead of swallowing them.
-
-```go
-q, _ := input.LineQueue("accounts.txt")   // thread-safe Queue[string] of trimmed, non-empty lines
-for {
-	acct, ok := q.Next()                  // each item handed to exactly one worker
-	if !ok { break }                      // drained
-	// ... process acct ...
-}
-```
-
-- Readers: `Lines`, `NonEmptyLines`, `Files(dir)`, `Columns(path, sep)`, `CSV(path)`.
-- **`Queue[T]`**: `NewQueue`, `Next` (drain in order), `Random` (sample with replacement, never empties), `Remaining`, `Reset`, `Len`; `LineQueue(path)` convenience.
-
-### proxy — parse, pool, check
-
-```go
-pool, _ := proxy.LoadPool("proxies.txt")   // parses every common format, skips bad lines
-p, ok := pool.Next()                        // round-robin; pool.Random() samples with replacement
-_ = proxy.Check(p, 5*time.Second)           // optional liveness gate via ip-api.com
-url := p.URL()                              // scheme://[user:pass@]host:port
-```
-
-`Parse` accepts `host:port`, `host:port:user:pass`, `user:pass@host:port`, `host:port@user:pass`, and `scheme://[user:pass@]host:port`, returning descriptive errors. `Proxy` exposes `HasAuth`, `Addr`, `URL`; parse in bulk with `ParseLines` / `ParseFile`.
-
-### logger — scoped, colored, tee-able
-
-```go
-l := logger.NewLogger("[App]", nil)          // root
-w := logger.NewLogger("[Worker-3]", l)        // child: prefix "[App] [Worker-3]", shares the mutex + file
-w.Println("started"); w.Success("ok"); w.Error("boom")
-l.SetLogPath("run.log")                       // also tee every line to a file
-```
-
-Loggers form a tree; children share the parent's mutex (concurrent writes never interleave) and file destination. All methods are goroutine-safe.
-
-### mail — one-time verification codes
-
-A long-lived, concurrency-safe IMAP poller for pulling OTP / verification codes out of a (often catch-all) mailbox. Open one per mailbox at start; call `FetchCode` from every worker — requests multiplex over a single kept-alive, auto-reconnecting connection. Pure-Go IMAP over implicit TLS, no external dependency.
-
-```go
-f, _ := mail.NewCodeFetcher(host, port, user, pass)
-defer f.Stop()
-
-// The mailTime idiom — capture BEFORE the action that triggers the email.
-mailTime := time.Now().UnixMilli()
-browser.Click(ctx, browserscale.CSS("#send-code"))     // triggers the send
-
-code, err := f.FetchCode(ctx,
-	"noreply@service.com", // fromEmail  ("" = any sender)
-	toEmail,               // toEmail    (the account address on a catch-all mailbox; "" = any)
-	"",                    // subjectKeyword ("" = skip)
-	`(\d{6})`,             // codeRegex  (ONE capture group; first submatch returned)
-	mailTime-60_000,       // sinceUnixMilli (mailTime minus ~60s clock-skew buffer)
-	60_000,                // maxSearchTimeMs
-	true,                  // deleteAfterFetch (keeps a shared mailbox clean)
-)
-```
-
-> **Why `mailTime`?** IMAP's `SINCE` search is day-granular, so `FetchCode` filters on the millisecond-precision `INTERNALDATE` client-side. Passing the timestamp captured *before* the trigger (minus a skew buffer) is what guarantees you match the fresh code and never a stale one left in the mailbox. `EnableDebug()` turns on verbose connection logging; the package is silent by default.
-
-## Ecosystem
-
-`browserscale-kit` is one of three companion projects:
-
-| Project | Role |
-| --- | --- |
-| [**browserscale-go**](https://github.com/browserscale/browserscale-go) | The SDK — rent and drive a real cloud Chromium session (navigate, wait, click, fill, read, evaluate, captcha, cookies…). |
-| [**browserscale**](https://github.com/browserscale/browserscale) | The CLI: `browserscale init` — scaffold a runnable module that already imports this kit and the SDK, with agent-ready docs. |
-| **browserscale-kit** (you are here) | The toolkit *around* the browser: config, store, queues, proxies, logging, mail. |
-
-Also available: [**browserscale-ts**](https://github.com/browserscale/browserscale-ts), the TypeScript SDK.
-
-## Design notes
-
-- **Pure Go, single binary.** No CGO anywhere — the store's SQLite is `modernc.org/sqlite`.
-- **Concurrency-first.** `store`, `input.Queue`, `proxy.Pool`, `logger`, and `mail.CodeFetcher` are all safe for use from many goroutines; the store is safe across processes too.
-- **The kit helps, it doesn't dictate.** Every package stands alone. Reach for `harness` for the fast path, or wire the pieces yourself.
+Up to v0.2.0 the kit had a different API, built around the `module` and `harness` packages. It is no longer developed; those releases stay available under their tags.
 
 ## License
 
-MIT © browserscale
+MIT

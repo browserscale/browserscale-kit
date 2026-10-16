@@ -1,20 +1,20 @@
-// Package configurator orchestrates the configuration phase of a task:
-// pick a module from the registry, load any existing JSON config, let
-// the user edit it through a Renderer, validate, save, and pick a run name.
+// Package configurator orchestrates the configuration phase of a run: load
+// the JSON config, let the user edit it through a Renderer, validate, save,
+// and pick a run name.
 //
-// All UI work lives in a Renderer (see renderer.go and huh_renderer.go);
-// the Configurator itself is purely flow control + JSON I/O so we can
-// swap front-ends (CLI now, GUI later) without touching modules or run
-// setup.
+// All UI work lives in a Renderer (see renderer.go and huh_renderer.go); the
+// Configurator itself is purely flow control + JSON I/O.
 package configurator
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
-	"github.com/browserscale/browserscale-kit/module"
+	"github.com/browserscale/browserscale-kit/form"
 )
 
 // Configurator drives the configuration phase before a run.
@@ -35,117 +35,85 @@ type Configurator struct {
 	// Optional non-interactive overrides. When set, the corresponding
 	// step is skipped:
 	//
-	//   - PreselectedModuleName: module is looked up by Name().
 	//   - PreselectedRunName: validated and used as the run folder name.
 	//   - SkipEdit: load + validate ConfigPath, do not open the editor
-	//     and do not write the file back. Requires ConfigPath to exist.
+	//     and do not write the file back. Requires ConfigPath to exist
+	//     unless the schema has no required fields without a default.
 	//     When PreselectedRunName is also empty, a timestamp run name is
 	//     chosen automatically.
-	PreselectedModuleName string
-	PreselectedRunName    string
-	SkipEdit              bool
+	PreselectedRunName string
+	SkipEdit           bool
+	// Overrides are values over ConfigPath's, by field name, for this run
+	// only: they're validated with the rest but not saved.
+	Overrides map[string]any
 }
 
-// Result is everything the caller needs to launch the run.
-type Result struct {
-	Module  module.Module
-	RunName string
-}
-
-// Run drives the full configuration flow:
+// Run drives the full configuration flow for schema:
 //
-//  1. Pick the module — PreselectedModuleName, or auto when exactly one
-//     module is registered, else Renderer.SelectModule.
-//  2. schema.ApplyDefaults() then LoadJSON from ConfigPath when it exists.
-//  3. EditConfig — skipped when SkipEdit; otherwise the renderer loops
+//  1. schema.ApplyDefaults() then LoadJSON from ConfigPath when it exists.
+//  2. EditConfig — skipped when SkipEdit; otherwise the renderer loops
 //     until the schema validates against FilesDirectory.
-//  4. SaveJSON to ConfigPath — skipped when SkipEdit.
-//  5. Pick a run name — PreselectedRunName, or a timestamp when SkipEdit,
+//  3. SaveJSON to ConfigPath — skipped when SkipEdit.
+//  4. Pick a run name — PreselectedRunName, or a timestamp when SkipEdit,
 //     else Renderer.PromptRunName.
 //
 // On user cancellation at any interactive step, an error wrapping
 // ErrCanceled is returned and no persistence occurs (except edits already
-// saved in step 4 when the user cancels the run-name prompt).
-func (c *Configurator) Run(modules []module.Module) (*Result, error) {
+// saved in step 3 when the user cancels the run-name prompt).
+func (c *Configurator) Run(schema *form.Schema) (runName string, err error) {
 	if c.ConfigPath == "" {
-		return nil, fmt.Errorf("configurator: ConfigPath is required")
+		return "", fmt.Errorf("configurator: ConfigPath is required")
 	}
 
-	selected, err := c.pickModule(modules)
-	if err != nil {
-		return nil, err
-	}
-
-	schema := selected.Schema()
 	schema.ApplyDefaults()
-
 	if _, statErr := os.Stat(c.ConfigPath); statErr == nil {
 		if err := schema.LoadJSON(c.ConfigPath); err != nil && c.SkipEdit {
-			return nil, fmt.Errorf("load config %s: %w", c.ConfigPath, err)
+			return "", fmt.Errorf("load config %s: %w", c.ConfigPath, err)
 		}
-	} else if c.SkipEdit {
-		return nil, fmt.Errorf("config file not found: %s (run once interactively, or create it)", c.ConfigPath)
+	}
+	if err := applyOverrides(schema, c.Overrides); err != nil {
+		return "", err
 	}
 
 	if c.SkipEdit {
 		if errs := schema.Validate(c.FilesDirectory); len(errs) > 0 {
-			return nil, fmt.Errorf("config %s is invalid: %s", c.ConfigPath, errs.Error())
+			if len(c.Overrides) > 0 {
+				return "", fmt.Errorf("config %s with this run's settings is invalid: %s", c.ConfigPath, errs.Error())
+			}
+			return "", fmt.Errorf("config %s is invalid: %s", c.ConfigPath, errs.Error())
 		}
 	} else {
 		if c.Renderer == nil {
-			return nil, fmt.Errorf("configurator: Renderer is nil (interactive edit required)")
+			return "", fmt.Errorf("configurator: Renderer is nil (interactive edit required)")
 		}
+		c.Renderer.Greet(schema.DisplayName)
 		if err := c.Renderer.EditConfig(schema, c.FilesDirectory); err != nil {
-			return nil, fmt.Errorf("edit config: %w", err)
+			return "", fmt.Errorf("edit config: %w", err)
 		}
 		if err := os.MkdirAll(filepath.Dir(c.ConfigPath), 0o755); err != nil {
-			return nil, fmt.Errorf("mkdir config dir: %w", err)
+			return "", fmt.Errorf("mkdir config dir: %w", err)
 		}
 		if err := schema.SaveJSON(c.ConfigPath); err != nil {
-			return nil, fmt.Errorf("save config: %w", err)
+			return "", fmt.Errorf("save config: %w", err)
 		}
 	}
 
-	runName, err := c.pickRunName()
-	if err != nil {
-		return nil, err
-	}
-
-	return &Result{
-		Module:  selected,
-		RunName: runName,
-	}, nil
+	return c.pickRunName()
 }
 
-func (c *Configurator) pickModule(modules []module.Module) (module.Module, error) {
-	if c.PreselectedModuleName != "" {
-		for _, m := range modules {
-			if m.Name() == c.PreselectedModuleName {
-				return m, nil
-			}
+func applyOverrides(schema *form.Schema, values map[string]any) error {
+	names := slices.Sorted(maps.Keys(values))
+	for _, name := range names {
+		if schema.Field(name) == nil {
+			return fmt.Errorf("the settings have no field %q", name)
 		}
-		available := make([]string, 0, len(modules))
-		for _, m := range modules {
-			available = append(available, m.Name())
+	}
+	for _, name := range names {
+		if err := schema.Field(name).Set(values[name]); err != nil {
+			return fmt.Errorf("setting %s: %w", name, err)
 		}
-		return nil, fmt.Errorf("unknown module %q (available: %v)", c.PreselectedModuleName, available)
 	}
-
-	if len(modules) == 1 {
-		return modules[0], nil
-	}
-
-	if c.Renderer == nil {
-		return nil, fmt.Errorf("configurator: Renderer is nil (interactive module selection required)")
-	}
-	selected, err := c.Renderer.SelectModule(modules)
-	if err != nil {
-		return nil, fmt.Errorf("select module: %w", err)
-	}
-	if selected == nil {
-		return nil, fmt.Errorf("no module selected")
-	}
-	return selected, nil
+	return nil
 }
 
 func (c *Configurator) pickRunName() (string, error) {

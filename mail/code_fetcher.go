@@ -33,7 +33,7 @@ const (
 // triggers the send, then pass it as sinceUnixMilli:
 //
 //	mailTime := time.Now().UnixMilli()
-//	browser.Click(ctx, browserscale.CSS("#send-code")) // triggers the email
+//	page.Click(ctx, browserscale.CSS("#send-code")) // triggers the email
 //	code, err := f.FetchCode(ctx, from, toEmail, "", codeRegex, mailTime-60_000, 60_000, true)
 //
 // Subtract a skew buffer (~60s) because the mail server's clock and the local
@@ -93,7 +93,7 @@ func NewCodeFetcher(host string, port int, username string, password string) (*C
 		password:      password,
 	}
 
-	// Create initial connection (inline like SolarRobot)
+	// Create initial connection
 	client := NewIMAPClient(host, port, username, password)
 	if err := client.Connect(); err != nil {
 		return nil, fmt.Errorf("failed to connect: %v", err)
@@ -120,7 +120,7 @@ func (f *CodeFetcher) mainLoop() {
 		case <-f.stopChan:
 			return
 		default:
-			// Check if client is nil or not responsive (like SolarRobot)
+			// Check if client is nil or not responsive
 			if f.IMAPClient == nil || f.IMAPClient.Noop() != nil {
 				if f.IMAPClient != nil {
 					if f.debug {
@@ -175,7 +175,7 @@ func (f *CodeFetcher) mainLoop() {
 				}
 			}
 
-			// Process all active requests (like SolarRobot processes all SearchOperations)
+			// Process all active requests
 			now := time.Now()
 			writeIdx := 0
 			processedAny := false
@@ -196,12 +196,12 @@ func (f *CodeFetcher) mainLoop() {
 				}
 
 				if err != nil {
-					// Dispose client and break loop (like SolarRobot)
+					// Dispose client and break loop
 					if f.IMAPClient != nil {
 						f.IMAPClient.Disconnect()
 						f.IMAPClient = nil
 					}
-					break // Break the loop on error like SolarRobot
+					break
 				}
 
 				// Keep for next iteration
@@ -213,7 +213,7 @@ func (f *CodeFetcher) mainLoop() {
 
 			// Add delay between searches to avoid server-side rate limiting
 			if processedAny {
-				time.Sleep(5 * time.Second) // Same as SolarRobot
+				time.Sleep(5 * time.Second)
 			} else {
 				time.Sleep(FETCH_INTERVAL)
 			}

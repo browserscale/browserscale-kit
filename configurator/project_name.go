@@ -36,10 +36,3 @@ func ValidateRunName(name string) error {
 	}
 	return nil
 }
-
-// ValidateProjectName is a deprecated alias for ValidateRunName that
-// ignores tasksDirectory. Prefer ValidateRunName.
-func ValidateProjectName(tasksDirectory, name string) error {
-	_ = tasksDirectory
-	return ValidateRunName(name)
-}

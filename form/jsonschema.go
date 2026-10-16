@@ -73,6 +73,21 @@ func fieldToJSONSchema(f *Field) map[string]any {
 	if f.Default != nil {
 		out["default"] = f.Default
 	}
+	if f.Section != "" {
+		out["x-section"] = f.Section
+	}
+	if f.Secret {
+		out["x-secret"] = true
+	}
+	if f.Placeholder != "" {
+		out["x-placeholder"] = f.Placeholder
+	}
+	if f.Min != nil {
+		out["minimum"] = *f.Min
+	}
+	if f.Max != nil {
+		out["maximum"] = *f.Max
+	}
 	switch f.Kind {
 	case KindString:
 		out["type"] = "string"
@@ -97,6 +112,9 @@ func fieldToJSONSchema(f *Field) map[string]any {
 		out["format"] = "file-path"
 		if f.FileTag != "" {
 			out["x-fileTag"] = f.FileTag
+		}
+		if f.Proxies != nil {
+			out["x-proxies"] = f.Proxies
 		}
 	case KindStringList:
 		out["type"] = "array"

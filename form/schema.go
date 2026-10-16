@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/browserscale/browserscale-kit/input"
 	"github.com/browserscale/browserscale-kit/proxy"
@@ -172,45 +173,46 @@ func (e ValidationErrors) HasErrors() bool { return len(e) > 0 }
 func (s *Schema) Validate(filesDirectory string) ValidationErrors {
 	var errs ValidationErrors
 	for _, f := range s.VisibleFields() {
-		val := f.Get()
-
-		if f.Required && isZeroish(val) {
-			errs = append(errs, ValidationError{
-				Field:   f.Name,
-				Message: "required",
-			})
-			continue
-		}
-
-		if f.Kind == KindFile {
-			fname, _ := val.(string)
-			if fname == "" {
-				continue // optional + empty
-			}
-			if msg := ValidateFileField(filesDirectory, fname, f.FileTag); msg != "" {
-				errs = append(errs, ValidationError{Field: f.Name, Message: msg})
-				continue
-			}
-			if f.fileValidate != nil {
-				absPath := fname
-				if filesDirectory != "" && !filepath.IsAbs(fname) {
-					absPath = filepath.Join(filesDirectory, fname)
-				}
-				if err := f.fileValidate(absPath); err != nil {
-					errs = append(errs, ValidationError{Field: f.Name, Message: err.Error()})
-					continue
-				}
-			}
-		}
-
-		if err := f.Validate(); err != nil {
-			errs = append(errs, ValidationError{
-				Field:   f.Name,
-				Message: err.Error(),
-			})
+		if msg := f.Check(filesDirectory); msg != "" {
+			errs = append(errs, ValidationError{Field: f.Name, Message: msg})
 		}
 	}
 	return errs
+}
+
+// Check runs Validate's checks on this one field, whether it's visible or
+// not, and returns the first failure's message, or "" when it passes.
+func (f *Field) Check(filesDirectory string) string {
+	val := f.Get()
+	if f.Required && isZeroish(val) {
+		return "required"
+	}
+	if f.Kind == KindFile {
+		fname, _ := val.(string)
+		if f.FileTag == TagProxies {
+			if msg, _ := CheckProxies(filesDirectory, fname, f.Proxies); msg != "" || fname == "" {
+				return msg
+			}
+		} else if fname == "" {
+			return "" // optional + empty
+		} else if msg := ValidateFileField(filesDirectory, fname, f.FileTag); msg != "" {
+			return msg
+		}
+		_, managed := proxy.Managed(fname)
+		if f.fileValidate != nil && !(f.FileTag == TagProxies && (proxy.IsRef(fname) || managed)) {
+			absPath := fname
+			if filesDirectory != "" && !filepath.IsAbs(fname) {
+				absPath = filepath.Join(filesDirectory, fname)
+			}
+			if err := f.fileValidate(absPath); err != nil {
+				return err.Error()
+			}
+		}
+	}
+	if err := f.Validate(); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // ValidateFileField is the standalone file-tag validator used by Validate.
@@ -223,10 +225,22 @@ func (s *Schema) Validate(filesDirectory string) ValidationErrors {
 //	TagLines     -> file exists and has at least one non-empty line
 //	TagLinesPath -> same as TagLines (path is what consumers use, but
 //	                content is checked the same way)
-//	TagProxies   -> file exists and parses to at least one proxy
+//	TagProxies   -> file exists and parses to at least one proxy; a saved
+//	                source (proxy:<id>) or spec (.json) must load
 //
 // Unknown tags fall back to TagRaw semantics.
 func ValidateFileField(filesDirectory, fileName, tag string) string {
+	if tag == TagProxies {
+		if _, ok := proxy.Managed(fileName); ok {
+			return ""
+		}
+	}
+	if tag == TagProxies && proxy.IsRef(fileName) {
+		if _, err := proxy.Open(filesDirectory, fileName); err != nil {
+			return err.Error()
+		}
+		return ""
+	}
 	full := fileName
 	if filesDirectory != "" {
 		full = filepath.Join(filesDirectory, fileName)
@@ -244,12 +258,107 @@ func ValidateFileField(filesDirectory, fileName, tag string) string {
 			return "file is empty"
 		}
 	case TagProxies:
-		list, _ := proxy.ParseFile(full)
-		if len(list) == 0 {
+		if _, err := proxy.Open("", full); err != nil {
+			if strings.EqualFold(filepath.Ext(full), ".json") {
+				return err.Error()
+			}
 			return "no parseable proxies found"
 		}
 	}
 	return ""
+}
+
+// CheckProxies checks a proxies setting's value against what the bot needs:
+// problem is why it can't be used, note what it doesn't quite give the bot.
+// rule may be nil.
+func CheckProxies(filesDirectory, value string, rule *ProxyRule) (problem, note string) {
+	var r ProxyRule
+	if rule != nil {
+		r = *rule
+	}
+	if cc, ok := proxy.Managed(value); ok {
+		switch {
+		case cc != "" && !proxy.ValidCountry(cc):
+			return fmt.Sprintf("%q isn't a country code; write managed:de, for example", cc), ""
+		case !r.fits(proxy.KindManaged) && value == "":
+			return "pick its proxies: this bot " + r.takes(), ""
+		case !r.fits(proxy.KindManaged):
+			return "this bot " + r.takes() + ", not browserscale's managed proxies", ""
+		case r.Address == AddressKeep:
+			return "", "Managed proxies give every browser another address; accounts keep theirs only with static IPs."
+		case cc != "" && r.Country != "" && cc != r.Country:
+			return "", fmt.Sprintf("This asks for %s; the bot is made for %s.", strings.ToUpper(cc), strings.ToUpper(r.Country))
+		}
+		return "", ""
+	}
+	if msg := ValidateFileField(filesDirectory, value, TagProxies); msg != "" {
+		return msg, ""
+	}
+	src, err := proxy.Open(filesDirectory, value)
+	if err != nil {
+		return err.Error(), ""
+	}
+	name := value
+	if proxy.IsRef(value) && src.Name != "" {
+		name = src.Name
+	}
+	if !r.fits(src.Kind) {
+		return fmt.Sprintf("%s is %s; this bot %s", name, kindNames[src.Kind], r.takes()), ""
+	}
+	switch {
+	case r.Address == AddressFresh && !src.Fresh():
+		note = "Every browser gets the same address through it; the bot wants a new one for each."
+	case r.Address == AddressKeep && src.Kind != proxy.KindStatic:
+		note = "Accounts keep their address only with static IPs, which have ids; through this one it changes."
+	}
+	if c := src.Country(); note == "" && c != "" && r.Country != "" && c != r.Country {
+		note = fmt.Sprintf("It asks for %s; the bot is made for %s.", strings.ToUpper(c), strings.ToUpper(r.Country))
+	}
+	return "", note
+}
+
+// Note is what a proxies field's value doesn't quite give the bot, or "".
+func (f *Field) Note(filesDirectory string) string {
+	if f.FileTag != TagProxies || f.Proxies == nil {
+		return ""
+	}
+	v, _ := f.Get().(string)
+	_, note := CheckProxies(filesDirectory, v, f.Proxies)
+	return note
+}
+
+var kindNames = map[string]string{
+	proxy.KindList:    "a proxy list",
+	proxy.KindGateway: "a gateway",
+	proxy.KindStatic:  "static IPs",
+	proxy.KindMobile:  "mobile proxies",
+	proxy.KindManaged: "browserscale's managed proxies",
+}
+
+func (r ProxyRule) fits(kind string) bool {
+	return len(r.Kinds) == 0 || slices.Contains(r.Kinds, kind)
+}
+
+// takes says which kinds fit, e.g. "takes a gateway or static IPs".
+func (r ProxyRule) takes() string {
+	names := make([]string, 0, len(r.Kinds))
+	for _, k := range r.Kinds {
+		names = append(names, or(kindNames[k], k))
+	}
+	switch len(names) {
+	case 0:
+		return "takes any proxies"
+	case 1:
+		return "takes " + names[0]
+	}
+	return "takes " + strings.Join(names[:len(names)-1], ", ") + " or " + names[len(names)-1]
+}
+
+func or(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // AllowedFileTags is the (closed) list of tags Validate understands. Useful

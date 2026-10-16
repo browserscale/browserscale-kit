@@ -16,6 +16,7 @@
 //	cfg := &MyConfig{}
 //	f := form.New("my_module", "My Module", cfg)
 //	f.Int("threads", &cfg.Threads).Label("Threads").Required().Default(1)
+//	f.Section("Proxies")
 //	f.Bool("useProxies", &cfg.UseProxies).Label("Use Proxies").Default(false)
 //	f.File("proxiesFile", &cfg.ProxiesFile).
 //	    Label("Proxies File").
@@ -34,6 +35,7 @@ type Form struct {
 	displayName string
 	target      any
 	fields      []*Field
+	section     string
 }
 
 // New starts a new form bound to the typed config pointer cfg.
@@ -50,31 +52,44 @@ func New(module, displayName string, cfg any) *Form {
 	}
 }
 
+// Section groups the fields added after it under title, until the next
+// Section. Renderers that lay the form out on a page show it as a heading;
+// it changes nothing about the config file.
+func (f *Form) Section(title string) *Form {
+	f.section = title
+	return f
+}
+
+func (f *Form) add(fld *Field) {
+	fld.Section = f.section
+	f.fields = append(f.fields, fld)
+}
+
 // String adds a text field bound to *ptr. name is the JSON key.
 func (f *Form) String(name string, ptr *string) *StringField {
 	b := newStringField(f, name, ptr)
-	f.fields = append(f.fields, b.f)
+	f.add(b.f)
 	return b
 }
 
 // Int adds an integer field bound to *ptr. name is the JSON key.
 func (f *Form) Int(name string, ptr *int) *IntField {
 	b := newIntField(f, name, ptr)
-	f.fields = append(f.fields, b.f)
+	f.add(b.f)
 	return b
 }
 
 // Float adds a float field bound to *ptr. name is the JSON key.
 func (f *Form) Float(name string, ptr *float64) *FloatField {
 	b := newFloatField(f, name, ptr)
-	f.fields = append(f.fields, b.f)
+	f.add(b.f)
 	return b
 }
 
 // Bool adds a boolean field bound to *ptr. name is the JSON key.
 func (f *Form) Bool(name string, ptr *bool) *BoolField {
 	b := newBoolField(f, name, ptr)
-	f.fields = append(f.fields, b.f)
+	f.add(b.f)
 	return b
 }
 
@@ -82,7 +97,7 @@ func (f *Form) Bool(name string, ptr *bool) *BoolField {
 // returned builder to add choices.
 func (f *Form) Select(name string, ptr *string) *SelectField {
 	b := newSelectField(f, name, ptr)
-	f.fields = append(f.fields, b.f)
+	f.add(b.f)
 	return b
 }
 
@@ -90,7 +105,17 @@ func (f *Form) Select(name string, ptr *string) *SelectField {
 // Use Tag() to attach a validation hint (TagLines, TagProxies, ...).
 func (f *Form) File(name string, ptr *string) *FileField {
 	b := newFileField(f, name, ptr)
-	f.fields = append(f.fields, b.f)
+	f.add(b.f)
+	return b
+}
+
+// Proxies adds the run's proxies setting bound to *ptr: a saved source
+// (proxy:<id>, proxy:<id>/<profile>), a proxy file in the files directory,
+// or browserscale's managed proxies ("managed", "managed:de"; also when
+// empty). Kinds, Fresh, Keeps and Country say what the bot needs of them.
+func (f *Form) Proxies(name string, ptr *string) *ProxiesField {
+	b := newProxiesField(f, name, ptr)
+	f.add(b.f)
 	return b
 }
 
@@ -99,7 +124,7 @@ func (f *Form) File(name string, ptr *string) *FileField {
 // stored form is always JSON array (["us","gb",...]).
 func (f *Form) StringList(name string, ptr *[]string) *StringListField {
 	b := newStringListField(f, name, ptr)
-	f.fields = append(f.fields, b.f)
+	f.add(b.f)
 	return b
 }
 

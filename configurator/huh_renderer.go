@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -12,7 +11,7 @@ import (
 
 	"github.com/browserscale/browserscale-kit/form"
 	"github.com/browserscale/browserscale-kit/input"
-	"github.com/browserscale/browserscale-kit/module"
+	"github.com/browserscale/browserscale-kit/proxy"
 )
 
 // HuhRenderer renders forms using charm.land/huh (v2). It binds huh
@@ -23,7 +22,7 @@ type HuhRenderer struct {
 	// Theme overrides huh's default theme. Use nil for huh.ThemeCharm.
 	Theme huh.Theme
 
-	// Banner is printed once at the start of SelectModule. If empty, a
+	// Banner is printed once by Greet. If empty, a
 	// minimal default banner is used. Apps embedding browserscale-kit
 	// typically override this with their own ASCII art.
 	Banner string
@@ -52,46 +51,16 @@ func mapAbort(err error) error {
 	return err
 }
 
-// ---------------- SelectModule ----------------
-
-func (r *HuhRenderer) SelectModule(modules []module.Module) (module.Module, error) {
-	if len(modules) == 0 {
-		return nil, errors.New("no modules available")
-	}
-
-	sorted := make([]module.Module, len(modules))
-	copy(sorted, modules)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Schema().DisplayName < sorted[j].Schema().DisplayName
-	})
-
+// Greet prints the banner once before the first prompt.
+func (r *HuhRenderer) Greet(title string) {
 	banner := r.Banner
 	if banner == "" {
 		banner = defaultBanner
 	}
 	fmt.Print(banner)
-
-	options := make([]huh.Option[int], 0, len(sorted))
-	for i, m := range sorted {
-		s := m.Schema()
-		options = append(options, huh.NewOption(
-			fmt.Sprintf("%s (%s)", s.DisplayName, m.Name()),
-			i,
-		))
+	if title != "" {
+		fmt.Println(title)
 	}
-
-	var idx int
-	err := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[int]().
-			Title("Select a module to run").
-			Options(options...).
-			Filtering(false).
-			Value(&idx),
-	)).WithTheme(r.theme()).Run()
-	if err != nil {
-		return nil, mapAbort(err)
-	}
-	return sorted[idx], nil
 }
 
 // ---------------- EditConfig ----------------
@@ -257,6 +226,12 @@ func buildWidget(f *form.Field, filesDirectory string) (huh.Field, error) {
 				// the time Validate runs, so f.Validate sees the live value.
 				return f.Validate()
 			})
+		if f.Secret {
+			w = w.EchoMode(huh.EchoModePassword)
+		}
+		if f.Placeholder != "" {
+			w = w.Placeholder(f.Placeholder)
+		}
 		if f.Help != "" {
 			w = w.Description(f.Help)
 		}
@@ -389,9 +364,24 @@ func buildWidget(f *form.Field, filesDirectory string) (huh.Field, error) {
 		files, _ := input.Files(filesDirectory)
 		opts := make([]huh.Option[string], 0, len(files)+1)
 		// Allow keeping an empty / not-set state.
-		opts = append(opts, huh.NewOption("(none)", ""))
+		none := "(none)"
+		if f.FileTag == form.TagProxies {
+			none = "(browserscale's managed proxies)"
+		}
+		opts = append(opts, huh.NewOption(none, ""))
+		if r := f.Proxies; r != nil && r.Country != "" {
+			opts = append(opts, huh.NewOption(fmt.Sprintf("browserscale's managed proxies in %s", strings.ToUpper(r.Country)), proxy.KindManaged+":"+r.Country))
+		}
 		for _, name := range files {
 			opts = append(opts, huh.NewOption(name, name))
+		}
+		if f.FileTag == form.TagProxies {
+			for _, s := range proxy.ListSaved() {
+				opts = append(opts, huh.NewOption(fmt.Sprintf("%s (saved %s)", s.Name, s.Kind), s.Ref))
+				for _, p := range s.Profiles {
+					opts = append(opts, huh.NewOption(fmt.Sprintf("%s / %s (saved %s)", s.Name, p, s.Kind), s.Ref+"/"+p))
+				}
+			}
 		}
 		w := huh.NewSelect[string]().
 			Title(title).
@@ -400,10 +390,15 @@ func buildWidget(f *form.Field, filesDirectory string) (huh.Field, error) {
 			Filtering(false).
 			Value(ptr).
 			Validate(func(selected string) error {
-				if selected == "" {
-					if f.Required {
-						return errors.New("required")
+				if selected == "" && f.Required {
+					return errors.New("required")
+				}
+				if f.FileTag == form.TagProxies {
+					if msg, _ := form.CheckProxies(filesDirectory, selected, f.Proxies); msg != "" {
+						return errors.New(msg)
 					}
+				}
+				if selected == "" {
 					return nil
 				}
 				if msg := form.ValidateFileField(filesDirectory, selected, f.FileTag); msg != "" {
@@ -412,6 +407,9 @@ func buildWidget(f *form.Field, filesDirectory string) (huh.Field, error) {
 				// Per-module content check (e.g. "must be a 7-col CSV").
 				// Runs inline so an obviously-wrong pick is rejected
 				// before the user even hits Continue.
+				if _, managed := proxy.Managed(selected); proxy.IsRef(selected) || (managed && f.FileTag == form.TagProxies) {
+					return f.Validate()
+				}
 				absPath := selected
 				if filesDirectory != "" && !filepath.IsAbs(selected) {
 					absPath = filepath.Join(filesDirectory, selected)
@@ -464,8 +462,8 @@ func formatMenuEntry(f *form.Field) string {
 
 // formatFieldValue renders the current bound value of a field for
 // display in the menu. Empty / zero values are shown as "(empty)" so
-// users see at a glance which fields still need input. No masking is
-// applied: secrets are displayed verbatim — keep your shoulders clear.
+// users see at a glance which fields still need input. Secret fields are
+// shown masked.
 func formatFieldValue(f *form.Field) string {
 	v := f.Get()
 	switch f.Kind {
@@ -473,6 +471,9 @@ func formatFieldValue(f *form.Field) string {
 		s, _ := v.(string)
 		if s == "" {
 			return "(empty)"
+		}
+		if f.Secret {
+			return "••••••"
 		}
 		return s
 	case form.KindBool:

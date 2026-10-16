@@ -1,8 +1,7 @@
-// Package proxy parses proxy list files and hands proxies out to workers.
-//
-// It is the modernized replacement for solar2-core's proxies package:
-// Parse now returns descriptive errors (the old one returned errors.New(""))
-// and accepts every common list format instead of just two.
+// Package proxy parses proxy lists and reads proxy sources: lists, provider
+// gateways written as templates, static addresses with ids and mobile
+// proxies that rotate on request (see Spec). Parse accepts every common list
+// format and says why a line doesn't parse.
 package proxy
 
 import (
@@ -135,6 +134,20 @@ func ParseFile(path string) ([]Proxy, error) {
 		return nil, err
 	}
 	return ParseLines(lines), nil
+}
+
+// BrowserScheme is the protocol a rented browser speaks to p: "http" (also
+// for no scheme) or "socks5", which socks5h is too since the browser leaves
+// name resolution to a SOCKS5 proxy anyway. ok is false for schemes it can't
+// use, such as https and socks4.
+func (p Proxy) BrowserScheme() (scheme string, ok bool) {
+	switch strings.ToLower(p.Scheme) {
+	case "", "http":
+		return "http", true
+	case "socks5", "socks5h":
+		return "socks5", true
+	}
+	return "", false
 }
 
 // HasAuth reports whether the proxy carries credentials.

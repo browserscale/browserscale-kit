@@ -28,9 +28,33 @@ const (
 	// loading, both tags behave identically here.
 	TagLinesPath = "lines_path"
 	// TagProxies means: the file must contain at least one parseable proxy
-	// (host:port or host:port:user:pass per line).
+	// (host:port or host:port:user:pass per line), or be a proxy source
+	// spec (.json); the value may also name a saved source, proxy:<id>, or
+	// browserscale's managed proxies, "managed" or "managed:<country>".
+	// Form.Proxies adds such a field with what the bot needs of them.
 	TagProxies = "proxies"
 )
+
+// What a proxies field asks of the address a browser gets, ProxyRule.Address.
+const (
+	// AddressFresh: every browser needs a new exit address.
+	AddressFresh = "fresh"
+	// AddressKeep: an account keeps its own address from job to job.
+	AddressKeep = "keep"
+)
+
+// ProxyRule is what a proxies field needs of the proxies it's given. Only
+// Kinds turns a setting down; the rest are notes beside it.
+type ProxyRule struct {
+	// Kinds are the kinds of source that fit (proxy.KindList, KindGateway,
+	// KindStatic, KindMobile, KindManaged); any when empty.
+	Kinds []string `json:"kinds,omitempty"`
+	// Address is AddressFresh, AddressKeep or "" for either.
+	Address string `json:"address,omitempty"`
+	// Country is the exit country the site needs, e.g. "de". Managed
+	// proxies get it unless the setting names another.
+	Country string `json:"country,omitempty"`
+}
 
 // SelectOption is one choice in a Select field.
 type SelectOption struct {
@@ -62,11 +86,23 @@ type Field struct {
 	Required bool
 	Default  any
 
+	// Section is the heading the field is grouped under, set with
+	// Form.Section; empty before the first one.
+	Section string
+	// Secret marks a string field whose value a renderer shows masked.
+	Secret bool
+	// Placeholder is a hint shown in an empty text field.
+	Placeholder string
+	// Min and Max are a number field's bounds, nil when unbounded.
+	Min, Max *float64
+
 	// Options populated for Kind == KindSelect.
 	Options []SelectOption
 
 	// FileTag populated for Kind == KindFile. Empty means TagRaw.
 	FileTag string
+	// Proxies is a proxies field's rule, set by Form.Proxies.
+	Proxies *ProxyRule
 
 	// ptr is the typed pointer the field is bound to (*string, *int, *float64,
 	// *bool, *[]string). Renderers may type-switch on this to bind the field
