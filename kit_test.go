@@ -41,6 +41,9 @@ func (f *fakeBrowserscale) hooks() hooks {
 			}
 			return &browserscale.CloudBrowser{}, nil
 		},
+		proxyOf: func(context.Context, *browserscale.CloudBrowser) (proxy.Proxy, error) {
+			return proxy.Proxy{Host: "managed.example", Port: 9}, nil
+		},
 		attach: func(ctx context.Context, grpc, key, session string) (*browserscale.CloudBrowser, error) {
 			return &browserscale.CloudBrowser{}, nil
 		},
@@ -358,6 +361,121 @@ func TestUseProxyPicksStaticEntry(t *testing.T) {
 	r := runBot(t, b, Options{}, fb, map[string]string{"config.json": `{"proxies":"proxy:acc"}`})
 	if r.rep.Ends[EndDone] != 2 || strings.Join(got, ",") != "b2,b2" {
 		t.Fatalf("report %+v, ids %v, err %v", r.rep, got, r.err)
+	}
+}
+
+const sessionProxies = "a.example:1000:u:pw_session-{session}\nb.example:2000:u:pw_session-{session}\n"
+
+func TestProxyWithoutBrowser(t *testing.T) {
+	t.Setenv("BROWSERSCALE_API_KEY", "k")
+	var seen []string
+	b := Bot[proxied, none]{
+		Settings: proxiedSettings,
+		Job: func(j *Job, s *proxied, _ none) error {
+			p, err := j.Proxy()
+			if err != nil {
+				return err
+			}
+			again, _ := j.Proxy()
+			seen = append(seen, p.URL(), again.URL())
+			if j.Try == 1 {
+				return j.BadProxy("the API turned the address away")
+			}
+			if _, err := j.Browser(); err != nil {
+				return err
+			}
+			after, _ := j.Proxy()
+			seen = append(seen, after.URL())
+			return nil
+		},
+	}
+	fb := &fakeBrowserscale{}
+	r := runBot(t, b, Options{}, fb, map[string]string{"proxies.txt": sessionProxies})
+	if r.err != nil || r.rep.Ends[EndDone] != 1 || fb.rented != 1 || len(seen) != 5 {
+		t.Fatalf("report %+v, err %v, rented %d, seen %v", r.rep, r.err, fb.rented, seen)
+	}
+	if seen[0] != seen[1] || strings.Contains(seen[0], "{session}") || !strings.Contains(seen[0], "a.example") {
+		t.Fatalf("first try = %v", seen[:2])
+	}
+	if seen[2] != seen[3] || seen[3] != seen[4] || !strings.Contains(seen[2], "b.example") {
+		t.Fatalf("second try = %v", seen[2:])
+	}
+	var browserProxy any
+	for _, e := range r.events {
+		if e.Type == "browser" {
+			browserProxy = e.Data["proxy"]
+		}
+	}
+	if browserProxy != "b.example:2000" {
+		t.Fatalf("browser went through %v", browserProxy)
+	}
+}
+
+func TestProxyOfManagedComesWithBrowser(t *testing.T) {
+	t.Setenv("BROWSERSCALE_API_KEY", "k")
+	var before error
+	var after proxy.Proxy
+	b := Bot[none, none]{
+		Job: func(j *Job, s *none, _ none) error {
+			_, before = j.Proxy()
+			if _, err := j.Browser(); err != nil {
+				return err
+			}
+			var err error
+			after, err = j.Proxy()
+			return err
+		},
+	}
+	r := runBot(t, b, Options{}, nil, nil)
+	if !errors.Is(before, ErrManagedProxy) || after.Host != "managed.example" || r.rep.Ends[EndDone] != 1 {
+		t.Fatalf("before %v, after %+v, report %+v", before, after, r.rep)
+	}
+}
+
+func TestCloseBrowserKeepsProxy(t *testing.T) {
+	t.Setenv("BROWSERSCALE_API_KEY", "k")
+	var urls []string
+	b := Bot[proxied, none]{
+		Settings: proxiedSettings,
+		Browsers: func(s *proxied) int { return 1 },
+		Job: func(j *Job, s *proxied, _ none) error {
+			for range 2 {
+				if _, err := j.Page(); err != nil {
+					return err
+				}
+				p, _ := j.Proxy()
+				urls = append(urls, p.URL())
+				j.CloseBrowser()
+			}
+			return nil
+		},
+	}
+	fb := &fakeBrowserscale{}
+	r := runBot(t, b, Options{}, fb, map[string]string{"proxies.txt": sessionProxies})
+	if r.rep.Ends[EndDone] != 1 || fb.rented != 2 || len(fb.released) != 2 || len(urls) != 2 || urls[0] != urls[1] {
+		t.Fatalf("report %+v, err %v, rented %d, released %v, urls %v", r.rep, r.err, fb.rented, fb.released, urls)
+	}
+}
+
+func TestPinnedProxyThatFailsTriesAnother(t *testing.T) {
+	t.Setenv("BROWSERSCALE_API_KEY", "k")
+	fb := &fakeBrowserscale{rents: []error{errors.New("rent session failed: PROXY_CONNECTION_FAILED")}}
+	var used []string
+	b := Bot[proxied, none]{
+		Settings: proxiedSettings,
+		Job: func(j *Job, s *proxied, _ none) error {
+			p, err := j.Proxy()
+			if err != nil {
+				return err
+			}
+			used = append(used, p.Host)
+			_, err = j.Browser()
+			return err
+		},
+	}
+	r := runBot(t, b, Options{}, fb, map[string]string{"proxies.txt": sessionProxies})
+	if r.rep.Ends[EndDone] != 1 || fb.rented != 2 || strings.Join(used, ",") != "a.example,b.example" {
+		t.Fatalf("report %+v, err %v, rented %d, used %v", r.rep, r.err, fb.rented, used)
 	}
 }
 

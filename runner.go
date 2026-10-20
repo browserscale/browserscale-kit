@@ -14,12 +14,15 @@ import (
 	"time"
 
 	browserscale "github.com/browserscale/browserscale-go"
+	"github.com/browserscale/browserscale-kit/proxy"
 	"github.com/browserscale/browserscale-kit/store"
 )
 
 // hooks are the calls into browserscale, swapped in tests.
 type hooks struct {
-	rent    func(ctx context.Context, c *browserscale.BrowserConfig) (*browserscale.CloudBrowser, error)
+	rent func(ctx context.Context, c *browserscale.BrowserConfig) (*browserscale.CloudBrowser, error)
+	// proxyOf is the proxy a browser goes through, as the session reports it.
+	proxyOf func(ctx context.Context, b *browserscale.CloudBrowser) (proxy.Proxy, error)
 	attach  func(ctx context.Context, grpc, key, session string) (*browserscale.CloudBrowser, error)
 	release func(b *browserscale.CloudBrowser, keep bool)
 	session func(b *browserscale.CloudBrowser) (id, grpc string)
@@ -30,7 +33,15 @@ type hooks struct {
 
 func defaultHooks() hooks {
 	return hooks{
-		rent:   browserscale.RentBrowser,
+		rent: browserscale.RentBrowser,
+		proxyOf: func(ctx context.Context, b *browserscale.CloudBrowser) (proxy.Proxy, error) {
+			id, err := b.GetClientIdentity(ctx)
+			if err != nil {
+				return proxy.Proxy{}, err
+			}
+			p := id.Proxy
+			return proxy.Proxy{Scheme: p.Scheme, Host: p.Host, Port: p.Port, Username: p.Username, Password: p.Password}, nil
+		},
 		attach: browserscale.ConnectSession,
 		release: func(b *browserscale.CloudBrowser, keep bool) {
 			if keep {
@@ -156,46 +167,23 @@ func (rn *runner) browserFor(j *Job) error {
 	if rn.key == "" {
 		return &fatalError{msg: "There's no browserscale API key: set BROWSERSCALE_API_KEY, or add an apiKey setting."}
 	}
+	// A proxy the job took with Proxy stays its proxy: the browser goes out
+	// where its requests did.
+	pinned := j.proxy != nil && j.addr != nil
 	badProxies, failures := 0, 0
 	told := map[string]bool{}
 	for {
-		var e *proxyEntry
-		host, port, user, pass, scheme := "", 0, "", "", ""
-		if j.proxyID != "" && rn.proxies == nil {
-			return &fatalError{msg: fmt.Sprintf("Job %d asks for the proxy %s, but the run uses browserscale's managed proxies.", j.ID, j.proxyID)}
-		}
-		if rn.proxies != nil {
+		e, p := j.proxy, proxy.Proxy{}
+		if pinned {
+			p = *j.addr
+		} else {
 			var err error
-			if j.proxyID != "" {
-				if e, err = rn.proxies.byID(j.proxyID); err != nil {
-					return &fatalError{msg: fmt.Sprintf("Job %d asks for a proxy the run doesn't have: %v.", j.ID, err)}
-				}
-			} else {
-				e, err = rn.proxies.take(j.Ctx, func(d time.Duration) {
-					j.emit(Event{Type: "wait", Text: "every proxy rests after failing; the next one is back in " + d.Round(time.Second).String()})
-				})
-			}
-			if err != nil {
+			if e, p, err = rn.takeProxy(j); err != nil {
 				return err
 			}
-			if rn.proxies.rotation(e) {
-				j.emit(Event{Type: "wait", Text: fmt.Sprintf("proxy %s gets a new address", e.label())})
-				if err := e.e.Rotate(j.Ctx); err != nil {
-					if j.Ctx.Err() != nil {
-						return j.Ctx.Err()
-					}
-					j.emit(Event{Type: "log", Text: fmt.Sprintf("proxy %s didn't rotate: %v", e.label(), err)})
-				}
-			}
-			p, err := e.e.Render()
-			if err != nil {
-				return &fatalError{msg: fmt.Sprintf("Proxy %s can't be used: %v.", e.label(), err)}
-			}
-			host, port, user, pass = p.Host, p.Port, p.Username, p.Password
-			scheme, _ = p.BrowserScheme()
 		}
-		cfg := browserscale.NewBrowserConfig(rn.key, int(rn.lease.Seconds()), host, port, user, pass)
-		if scheme == "socks5" {
+		cfg := browserscale.NewBrowserConfig(rn.key, int(rn.lease.Seconds()), p.Host, p.Port, p.Username, p.Password)
+		if scheme, _ := p.BrowserScheme(); e != nil && scheme == "socks5" {
 			cfg.WithProxyScheme(browserscale.ProxySOCKS5)
 		}
 		if e != nil && e.e.Masque != "" {
@@ -210,6 +198,9 @@ func (rn *runner) browserFor(j *Job) error {
 		b, err := rn.h.rent(j.Ctx, cfg)
 		if err == nil {
 			j.browser, j.proxy = b, e
+			if e != nil {
+				j.addr = &p
+			}
 			id, _ := rn.h.session(b)
 			data := map[string]any{"session": id}
 			if e != nil {
@@ -236,6 +227,9 @@ func (rn *runner) browserFor(j *Job) error {
 			continue
 		}
 		if code == "PROXY_CONNECTION_FAILED" && e != nil {
+			if pinned {
+				return &retryError{reason: fmt.Sprintf("the job's proxy %s didn't connect to start a browser", e.label()), newProxy: true}
+			}
 			what := rn.proxies.rest(e)
 			j.emit(Event{Type: "wait", Text: fmt.Sprintf("proxy %s didn't connect; it %s", e.label(), what)})
 			if badProxies++; badProxies >= rn.proxies.tries() || j.proxyID != "" {
@@ -250,6 +244,43 @@ func (rn *runner) browserFor(j *Job) error {
 			return err
 		}
 	}
+}
+
+// takeProxy picks the job's proxy from the run's, gets a mobile one a new
+// address when it asked for one, and fills in the placeholders. e is nil
+// when the run uses browserscale's managed proxies.
+func (rn *runner) takeProxy(j *Job) (e *proxyEntry, p proxy.Proxy, err error) {
+	if rn.proxies == nil {
+		if j.proxyID != "" {
+			return nil, p, &fatalError{msg: fmt.Sprintf("Job %d asks for the proxy %s, but the run uses browserscale's managed proxies.", j.ID, j.proxyID)}
+		}
+		return nil, p, nil
+	}
+	if j.proxyID != "" {
+		if e, err = rn.proxies.byID(j.proxyID); err != nil {
+			return nil, p, &fatalError{msg: fmt.Sprintf("Job %d asks for a proxy the run doesn't have: %v.", j.ID, err)}
+		}
+	} else {
+		e, err = rn.proxies.take(j.Ctx, func(d time.Duration) {
+			j.emit(Event{Type: "wait", Text: "every proxy rests after failing; the next one is back in " + d.Round(time.Second).String()})
+		})
+		if err != nil {
+			return nil, p, err
+		}
+	}
+	if rn.proxies.rotation(e) {
+		j.emit(Event{Type: "wait", Text: fmt.Sprintf("proxy %s gets a new address", e.label())})
+		if err := e.e.Rotate(j.Ctx); err != nil {
+			if j.Ctx.Err() != nil {
+				return nil, p, j.Ctx.Err()
+			}
+			j.emit(Event{Type: "log", Text: fmt.Sprintf("proxy %s didn't rotate: %v", e.label(), err)})
+		}
+	}
+	if p, err = e.e.Render(); err != nil {
+		return nil, p, &fatalError{msg: fmt.Sprintf("Proxy %s can't be used: %v.", e.label(), err)}
+	}
+	return e, p, nil
 }
 
 type outcome struct {

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	browserscale "github.com/browserscale/browserscale-go"
+	"github.com/browserscale/browserscale-kit/proxy"
 	"github.com/browserscale/browserscale-kit/store"
 )
 
@@ -28,8 +29,10 @@ import (
 type Step func() (Step, error)
 
 // Job is one job of a run, and each retry of it a new Job. Its browser is
-// rented on first use and released when the job ends; a job that never asks
-// for one runs without.
+// rented on first use and released when the job ends or with CloseBrowser;
+// a job that never asks for one runs without. Its proxy is the same for the
+// whole try: what Proxy gives the job's own requests, its browsers go
+// through too.
 type Job struct {
 	// Ctx ends when the run is canceled.
 	Ctx context.Context
@@ -48,11 +51,13 @@ type Job struct {
 	page     *browserscale.Page
 	attached bool
 	proxy    *proxyEntry
-	proxyID  string
-	step     string
-	ended    *ending
-	watches  []watch
-	until    string
+	// addr is the proxy with its placeholders filled, once the try has one.
+	addr    *proxy.Proxy
+	proxyID string
+	step    string
+	ended   *ending
+	watches []watch
+	until   string
 }
 
 type ending struct{ name, detail string }
@@ -75,16 +80,75 @@ func (j *Job) Browser() (*browserscale.CloudBrowser, error) {
 	return j.browser, nil
 }
 
-// UseProxy makes the job's browser go through the proxy with this id, for
-// static proxies where an account keeps its address. Call it before the
-// first Browser or Page; a resting proxy is used anyway. An empty id takes
+// CloseBrowser gives the job's browser back now, before the job ends, e.g.
+// once the steps that need a page are done and requests take over. The job
+// keeps its proxy; a later Browser or Page rents a new browser through it.
+func (j *Job) CloseBrowser() {
+	if j.browser == nil {
+		return
+	}
+	j.rn.h.release(j.browser, j.attached)
+	j.browser, j.page = nil, nil
+	if j.proxy == nil {
+		// A managed or attached browser's address goes with it.
+		j.addr = nil
+	}
+	if j.slot {
+		<-j.rn.slots
+		j.slot = false
+	}
+}
+
+// Proxy is the job's proxy, for requests the job makes itself, such as with
+// browserscale-net-go: Proxy().URL() is what its client takes. It's taken
+// from the run's proxies on first use without renting a browser, and the
+// job's browsers go through it too; after a browser it's the one the browser
+// went through.
+//
+// browserscale's managed proxies come with a browser: until the job has one
+// they return ErrManagedProxy. A browser the run attached to reports its own.
+func (j *Job) Proxy() (proxy.Proxy, error) {
+	if j.addr != nil {
+		return *j.addr, nil
+	}
+	if j.browser == nil && j.rn.opts.Attach != "" && !j.rn.attached.Load() {
+		if _, err := j.Browser(); err != nil {
+			return proxy.Proxy{}, err
+		}
+	}
+	if j.browser != nil {
+		p, err := j.rn.h.proxyOf(j.Ctx, j.browser)
+		if err != nil {
+			return proxy.Proxy{}, err
+		}
+		j.addr = &p
+		return p, nil
+	}
+	e, p, err := j.rn.takeProxy(j)
+	if err != nil {
+		return proxy.Proxy{}, err
+	}
+	if e == nil {
+		return proxy.Proxy{}, ErrManagedProxy
+	}
+	j.proxy, j.addr = e, &p
+	return p, nil
+}
+
+// ErrManagedProxy is what Proxy returns for browserscale's managed proxies
+// while the job has no browser: their address comes with one.
+var ErrManagedProxy = errors.New("kit: the run uses browserscale's managed proxies, which come with a browser; rent it first, or pick a proxy source for requests without one")
+
+// UseProxy makes the job go through the proxy with this id, for static
+// proxies where an account keeps its address. Call it before the first
+// Proxy, Browser or Page; a resting proxy is used anyway. An empty id takes
 // the next proxy in turn again.
 func (j *Job) UseProxy(id string) {
 	j.proxyID = id
 }
 
-// ProxyID is the id of the proxy the job's browser goes through, or "" when
-// it has none, such as an entry of a plain list.
+// ProxyID is the id of the job's proxy, or "" when it has none, such as an
+// entry of a plain list.
 func (j *Job) ProxyID() string {
 	if j.proxy == nil {
 		return ""

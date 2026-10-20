@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	charm.land/huh/v2 v2.0.3
-	github.com/browserscale/browserscale-go v1.11.0
+	github.com/browserscale/browserscale-go v1.12.0
 	google.golang.org/grpc v1.84.0
 	modernc.org/sqlite v1.51.0
 )

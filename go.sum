@@ -12,8 +12,8 @@ github.com/atotto/clipboard v0.1.4 h1:EH0zSVneZPSuFR11BlR9YppQTVDbh5+16AmcJi4g1z
 github.com/atotto/clipboard v0.1.4/go.mod h1:ZY9tmq7sm5xIbd9bOK4onWV4S6X0u6GY7Vn0Yu86PYI=
 github.com/aymanbagabas/go-udiff v0.4.1 h1:OEIrQ8maEeDBXQDoGCbbTTXYJMYRCRO1fnodZ12Gv5o=
 github.com/aymanbagabas/go-udiff v0.4.1/go.mod h1:0L9PGwj20lrtmEMeyw4WKJ/TMyDtvAoK9bf2u/mNo3w=
-github.com/browserscale/browserscale-go v1.11.0 h1:bme60laxoOWNxzkTIG9sRo6Ej8Xo6Cig9Ue3W1Eg94o=
-github.com/browserscale/browserscale-go v1.11.0/go.mod h1:Nie6J6gbZoNEbK2eILpjZNWLKpZG2xMWfuJpNoreMhA=
+github.com/browserscale/browserscale-go v1.12.0 h1:Mrg0E3/O0O7slVw4W2ssuQCYqJEB5kgcNMAVJADgpJI=
+github.com/browserscale/browserscale-go v1.12.0/go.mod h1:Nie6J6gbZoNEbK2eILpjZNWLKpZG2xMWfuJpNoreMhA=
 github.com/catppuccin/go v0.2.0 h1:ktBeIrIP42b/8FGiScP9sgrWOss3lw0Z5SktRoithGA=
 github.com/catppuccin/go v0.2.0/go.mod h1:8IHJuMGaUUjQM82qBrGNBv7LFq6JI3NnQCF6MOlZjpc=
 github.com/charmbracelet/colorprofile v0.4.2 h1:BdSNuMjRbotnxHSfxy+PCSa4xAmz7szw70ktAtWRYrY=

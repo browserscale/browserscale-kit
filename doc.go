@@ -39,10 +39,11 @@
 // file, [Forever], [Every] and [At] for a run that keeps going, and [Queue]
 // for jobs that other jobs hand over. Threads is how many jobs run at once.
 // Each job gets its own browser, rented the first time it calls
-// [Job.Browser] or [Job.Page] and given back when it ends; a job that never
-// does, such as one that reads a mailbox or calls an API, runs without one.
-// Browsers limits how many browsers the jobs have at once, for bots whose
-// jobs need one only sometimes.
+// [Job.Browser] or [Job.Page] and given back when it ends or calls
+// [Job.CloseBrowser]; a job that never does, such as one that reads a
+// mailbox or calls an API, runs without one. Browsers limits how many
+// browsers the jobs have at once, for bots whose jobs need one only
+// sometimes.
 //
 // # Programs and tasks
 //
@@ -121,9 +122,11 @@
 //     a new address, and rests only after failing several times in a row;
 //   - a mobile proxy is asked for a new address before it's used again.
 //
-// [Job.UseProxy] pins a job to a static address by id, for accounts that
-// keep their address; [Job.ProxyID] says which one the browser went
-// through, to remember it with the account.
+// A job has one proxy per try. [Job.Proxy] gives it for requests the job
+// makes itself, without a browser; the job's browsers then go through the
+// same address. [Job.UseProxy] pins a job to a static address by id, for
+// accounts that keep their address; [Job.ProxyID] says which one the job
+// went through, to remember it with the account.
 //
 // # Files
 //
