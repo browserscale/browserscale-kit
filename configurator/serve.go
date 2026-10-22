@@ -273,7 +273,7 @@ func (s *server) write(id int, msg string, try bool) error {
 		fs := FieldState{
 			Name: f.Name, Kind: f.Kind, Label: f.Label, Help: f.Help, Section: f.Section, Placeholder: f.Placeholder,
 			Required: f.Required, Secret: f.Secret, Visible: f.Visible(), Conditional: f.HasPredicate(),
-			Value: f.Get(), Default: f.Default, Options: f.Options, FileTag: f.FileTag, Proxies: f.Proxies, Min: f.Min, Max: f.Max,
+			Value: f.Get(), Default: f.Default, Options: f.Options, FileTag: f.FileTag, Proxies: f.Proxies.Current(), Min: f.Min, Max: f.Max,
 		}
 		if w := f.VisibleWhenSpec(); w != nil {
 			fs.DependsOn = w.Field
@@ -299,14 +299,19 @@ func (s *server) check(f *form.Field) (msg, note string) {
 	}
 	name, _ := f.Get().(string)
 	st := s.stamp(name)
-	if c, ok := s.checks[f.Name]; ok && c.value == name && c.stamp == st {
+	// A proxies field's values can follow other fields (ParamFrom).
+	key := name
+	if f.Proxies != nil {
+		key += "\x00" + fmt.Sprint(f.Proxies.Wants())
+	}
+	if c, ok := s.checks[f.Name]; ok && c.value == key && c.stamp == st {
 		return c.msg, c.note
 	}
 	msg = f.Check(s.files)
 	if msg == "" {
 		note = f.Note(s.files)
 	}
-	s.checks[f.Name] = fileCheck{value: name, stamp: st, msg: msg, note: note}
+	s.checks[f.Name] = fileCheck{value: key, stamp: st, msg: msg, note: note}
 	return msg, note
 }
 

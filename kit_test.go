@@ -6,9 +6,12 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -304,7 +307,7 @@ func TestRentWaitsAndRotatesProxies(t *testing.T) {
 }
 
 func TestSessionToken(t *testing.T) {
-	src, err := proxy.Spec{Kind: proxy.KindList, Lines: []string{"h.example:1:user:pw_session-{session}_lifetime-3m"}}.Source("", "")
+	src, err := proxy.Spec{Kind: proxy.KindList, Lines: []string{"h.example:1:user:pw_session-{session}_lifetime-3m"}}.Source("", proxy.Ref{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +320,7 @@ func TestSessionToken(t *testing.T) {
 }
 
 func TestRotatingProxyStaysIn(t *testing.T) {
-	src, err := proxy.Spec{Kind: proxy.KindGateway, Name: "gw", Template: "gw.example:7000:u:p_session-{session}"}.Source("", "")
+	src, err := proxy.Spec{Kind: proxy.KindGateway, Name: "gw", Template: "gw.example:7000:u:p_session-{session}"}.Source("", proxy.Ref{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,6 +364,109 @@ func TestUseProxyPicksStaticEntry(t *testing.T) {
 	r := runBot(t, b, Options{}, fb, map[string]string{"config.json": `{"proxies":"proxy:acc"}`})
 	if r.rep.Ends[EndDone] != 2 || strings.Join(got, ",") != "b2,b2" {
 		t.Fatalf("report %+v, ids %v, err %v", r.rep, got, r.err)
+	}
+}
+
+func TestProxyParamLayers(t *testing.T) {
+	t.Setenv("BROWSERSCALE_API_KEY", "k")
+	dir := t.TempDir()
+	t.Setenv(proxy.SourcesEnv, dir)
+	spec := `{"kind":"gateway","name":"Res","template":"gw.example:7000:u:p_country-{country}_session-{session}_lifetime-{lifetime}","params":{"country":"us","lifetime":"3m"}}`
+	if err := os.WriteFile(filepath.Join(dir, "res.json"), []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	b := Bot[proxied, none]{
+		Settings: func(f *form.Form, s *proxied) {
+			f.Proxies("proxies", &s.Proxies).Country("de").Sticky(15 * time.Minute)
+		},
+		Jobs: func(r *Run, s *proxied) iter.Seq[none] { return Times[none](2, nil) },
+		Job: func(j *Job, s *proxied, _ none) error {
+			if j.ID == 2 {
+				j.ProxyParam(proxy.Country, "nl")
+			}
+			p, err := j.Proxy()
+			if err != nil {
+				return err
+			}
+			got = append(got, p.Password)
+			return nil
+		},
+	}
+	r := runBot(t, b, Options{Threads: 1}, &fakeBrowserscale{}, map[string]string{"config.json": `{"proxies":"proxy:res?lifetime=30m"}`})
+	if r.err != nil || len(got) != 2 {
+		t.Fatalf("report %+v, %v, got %v", r.rep, r.err, got)
+	}
+	slices.Sort(got)
+	if !strings.HasPrefix(got[0], "p_country-de_session-") || !strings.HasSuffix(got[0], "_lifetime-30m") ||
+		!strings.HasPrefix(got[1], "p_country-nl_session-") || !strings.HasSuffix(got[1], "_lifetime-30m") {
+		t.Fatalf("passwords %q", got)
+	}
+}
+
+type countrySettings struct {
+	Country string `json:"country"`
+	Proxies string `json:"proxies"`
+}
+
+// A job's default is under the user's value and over the bot's, which can
+// follow another setting.
+func TestProxyDefaultUnderSetting(t *testing.T) {
+	t.Setenv("BROWSERSCALE_API_KEY", "k")
+	dir := t.TempDir()
+	t.Setenv(proxy.SourcesEnv, dir)
+	spec := `{"kind":"gateway","name":"Res","template":"gw.example:7000:u:p_country-{country}_lifetime-{lifetime}","params":{"country":"us","lifetime":"3m"}}`
+	if err := os.WriteFile(filepath.Join(dir, "res.json"), []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(config string, soft string) string {
+		var got string
+		b := Bot[countrySettings, none]{
+			Settings: func(f *form.Form, s *countrySettings) {
+				f.String("country", &s.Country)
+				f.Proxies("proxies", &s.Proxies).Country("de").ParamFrom(proxy.Country, "country")
+			},
+			Job: func(j *Job, s *countrySettings, _ none) error {
+				if soft != "" {
+					j.ProxyDefault(proxy.Country, soft)
+					j.ProxyDefault(proxy.Sticky, "10m")
+				}
+				p, err := j.Proxy()
+				got = p.Password
+				return err
+			},
+		}
+		r := runBot(t, b, Options{}, &fakeBrowserscale{}, map[string]string{"config.json": config})
+		if r.err != nil {
+			t.Fatalf("%s: %v", config, r.err)
+		}
+		return got
+	}
+	for _, c := range []struct{ config, soft, want string }{
+		{`{"proxies":"proxy:res"}`, "", "p_country-de_lifetime-3m"},
+		{`{"proxies":"proxy:res","country":"IT"}`, "", "p_country-it_lifetime-3m"},
+		{`{"proxies":"proxy:res","country":"it"}`, "nl", "p_country-nl_lifetime-10m"},
+		{`{"proxies":"proxy:res?country=fr","country":"it"}`, "nl", "p_country-fr_lifetime-10m"},
+		{`{"proxies":"proxy:res?lifetime=30m"}`, "nl", "p_country-nl_lifetime-30m"},
+	} {
+		if got := run(c.config, c.soft); got != c.want {
+			t.Errorf("%s with %q: %q, want %q", c.config, c.soft, got, c.want)
+		}
+	}
+}
+
+// Without any proxies field a job's proxy values change nothing.
+func TestProxyDefaultWithoutProxies(t *testing.T) {
+	b := Bot[none, none]{
+		Job: func(j *Job, s *none, _ none) error {
+			j.ProxyDefault(proxy.Country, "de")
+			j.ProxyParam(proxy.Sticky, "5m")
+			return nil
+		},
+	}
+	r := runBot(t, b, Options{}, nil, nil)
+	if r.err != nil || r.rep.Ends[EndDone] != 1 {
+		t.Fatalf("report %+v, %v", r.rep, r.err)
 	}
 }
 
@@ -712,6 +818,129 @@ func TestRowsAndSave(t *testing.T) {
 	text, _ := os.ReadFile(filepath.Join(r.dir, "emails.txt"))
 	if string(text) != "a@x.com\nb@x.com\n" {
 		t.Fatalf("emails = %q", text)
+	}
+}
+
+type task struct {
+	Name  string `csv:"name"`
+	Tries int    `csv:"tries"`
+}
+
+// Items are pointers here, so a try's changes reach the next and Done; Done
+// keeps a file of what's left, Finish writes a summary.
+func TestDoneFinishAndRunFiles(t *testing.T) {
+	var mu sync.Mutex
+	left := map[string]*task{}
+	var results []Result
+	finished := 0
+	b := Bot[none, *task]{
+		Jobs: func(r *Run, s *none) iter.Seq[*task] {
+			all := []*task{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+			for _, t := range all {
+				left[t.Name] = t
+			}
+			if err := r.Rewrite("left.txt", all, CSV); err != nil {
+				r.Fail(err)
+			}
+			_ = r.Save("input", all[0])
+			return slices.Values(all)
+		},
+		Job: func(j *Job, s *none, t *task) error {
+			t.Tries++
+			if t.Name == "b" && t.Tries == 1 {
+				return j.Retry("once more")
+			}
+			if t.Name == "c" {
+				_, err := j.End("skipped", "nothing to do")
+				return err
+			}
+			return j.Save("pages/"+t.Name+".jsonl", map[string]any{"name": t.Name, "tries": t.Tries})
+		},
+		Done: func(r *Run, s *none, t *task, res Result) {
+			mu.Lock()
+			defer mu.Unlock()
+			results = append(results, res)
+			delete(left, t.Name)
+			var rest []*task
+			for _, n := range slices.Sorted(maps.Keys(left)) {
+				rest = append(rest, left[n])
+			}
+			_ = r.Rewrite("left.txt", rest, CSV)
+		},
+		Finish: func(r *Run, s *none) {
+			finished++
+			_ = r.Write("summary/report.txt", fmt.Appendf(nil, "%d done, %d skipped", r.Count(EndDone), r.Count("skipped")))
+		},
+	}
+	r := runBot(t, b, Options{Threads: 2}, nil, nil)
+	if r.err != nil || r.rep.Ends[EndDone] != 2 || r.rep.Ends["skipped"] != 1 {
+		t.Fatalf("report %+v, %v", r.rep, r.err)
+	}
+	if finished != 1 || len(results) != 3 {
+		t.Fatalf("finished %d, results %+v", finished, results)
+	}
+	tries := map[string]int{}
+	for _, res := range results {
+		tries[res.End] += res.Tries
+		if res.ID == 0 || res.Err != nil {
+			t.Errorf("result %+v", res)
+		}
+		if res.End == "skipped" && res.Detail != "nothing to do" {
+			t.Errorf("skipped: %+v", res)
+		}
+	}
+	if tries[EndDone] != 3 || tries["skipped"] != 1 {
+		t.Errorf("tries %v", tries)
+	}
+	if rows := readCSV(t, filepath.Join(r.dir, "left.txt")); len(rows) != 0 {
+		t.Errorf("left = %v", rows)
+	}
+	if text, _ := os.ReadFile(filepath.Join(r.dir, "pages", "b.jsonl")); string(text) != `{"name":"b","tries":2}`+"\n" {
+		t.Errorf("pages/b.jsonl = %q", text)
+	}
+	if rows := readCSV(t, filepath.Join(r.dir, "input.csv")); len(rows) != 2 || rows[0][0] != "name" {
+		t.Errorf("input = %v", rows)
+	}
+	if text, _ := os.ReadFile(filepath.Join(r.dir, "summary", "report.txt")); string(text) != "2 done, 1 skipped" {
+		t.Errorf("report = %q", text)
+	}
+}
+
+func TestSaveFormats(t *testing.T) {
+	sv := newSaver(t.TempDir())
+	type login struct{ Email, Password string }
+	for _, rec := range []login{{"a@x", "1"}, {"b@x", "2"}} {
+		if _, err := sv.save("ok.txt", rec, CSV); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sv.save("lines.txt", []string{rec.Email, rec.Password}, Delimited(':', false)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sv.save("plain.txt", rec.Email); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := map[string]string{
+		"ok.txt":    "Email,Password\na@x,1\nb@x,2\n",
+		"lines.txt": "a@x:1\nb@x:2\n",
+		"plain.txt": "a@x\nb@x\n",
+	}
+	for name, w := range want {
+		if got, _ := os.ReadFile(filepath.Join(sv.dir, name)); string(got) != w {
+			t.Errorf("%s = %q, want %q", name, got, w)
+		}
+	}
+	if _, err := sv.save("../out.csv", login{}); err == nil {
+		t.Error("a file outside the run's folder was written")
+	}
+	if _, err := sv.rewrite("ok.txt", []login{{"c@x", "3"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sv.save("ok.txt", login{"d@x", "4"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(sv.dir, "ok.txt")); string(got) != "Email,Password\nc@x,3\nd@x,4\n" {
+		t.Errorf("rewritten ok.txt = %q", got)
 	}
 }
 

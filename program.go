@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -48,6 +49,9 @@ type Program[S any] struct {
 	Lease     time.Duration
 	Retries   int
 	StopAfter int
+	// Finish runs once after every task is over, however the run ended,
+	// e.g. for a summary of all of them; r counts the jobs of all tasks.
+	Finish func(r *Run, s *S)
 }
 
 // Task is one kind of job of a Program. J is what one job works on.
@@ -63,6 +67,9 @@ type Task[S, J any] struct {
 	Job func(j *Job, s *S, item J) error
 	// Ends names the ways the task's jobs can end and what each means.
 	Ends Ends
+	// Done and Finish are a Bot's, for the task's jobs.
+	Done   func(r *Run, s *S, item J, res Result)
+	Finish func(r *Run, s *S)
 }
 
 // Tasker is a Task of any job type, for Program.Tasks.
@@ -76,26 +83,37 @@ type taskPlan[S any] struct {
 	ends    Ends
 	threads func(s *S) int
 	hasJob  bool
+	finish  func(r *Run, s *S)
 	// open starts the task's source: next gives the next job's work, stop
 	// lets the source go.
-	open func(r *Run, s *S) (next func() (func(j *Job) error, bool), stop func())
+	open func(r *Run, s *S) (next func() (work, bool), stop func())
+}
+
+// work is one job of a task: run does a try, done hears how it ended.
+type work struct {
+	run  func(j *Job) error
+	done func(res Result)
 }
 
 func (t Task[S, J]) plan() taskPlan[S] {
 	return taskPlan[S]{
-		name: t.Name, ends: t.Ends, threads: t.Threads, hasJob: t.Job != nil,
-		open: func(r *Run, s *S) (func() (func(*Job) error, bool), func()) {
+		name: t.Name, ends: t.Ends, threads: t.Threads, hasJob: t.Job != nil, finish: t.Finish,
+		open: func(r *Run, s *S) (func() (work, bool), func()) {
 			items := Times[J](1, nil)
 			if t.Jobs != nil {
 				items = t.Jobs(r, s)
 			}
 			next, stop := iter.Pull(items)
-			return func() (func(*Job) error, bool) {
+			return func() (work, bool) {
 				item, ok := next()
 				if !ok {
-					return nil, false
+					return work{}, false
 				}
-				return func(j *Job) error { return t.Job(j, s, item) }, true
+				w := work{run: func(j *Job) error { return t.Job(j, s, item) }}
+				if t.Done != nil {
+					w.done = func(res Result) { t.Done(r, s, item, res) }
+				}
+				return w, true
 			}, stop
 		},
 	}
@@ -271,16 +289,14 @@ func (p Program[S]) start(ctx context.Context, o Options, h hooks) (*Report, err
 		retries: limit(p.Retries, 2), stopAfter: limit(p.StopAfter, 10),
 	}
 	defer rn.closeStore()
+	core.runDir, core.out, core.emit = runDir, rn.saves, ev.emit
 	values := schema.ToMap()
 	rn.key = apiKey(values)
 	name, rule := proxySetting(schema, values)
 	if cc, managed := proxy.Managed(name); managed {
-		rn.country = cc
-		if cc == "" && rule != nil {
-			rn.country = rule.Country
-		}
+		rn.country, rn.botCountry = cc, rule.Wants()[proxy.Country]
 	} else {
-		src, err := proxy.Open(dataDir, name)
+		src, err := proxy.Open(dataDir, name, rule.Wants())
 		if err != nil {
 			return nil, fmt.Errorf("read proxies: %w", err)
 		}
@@ -346,19 +362,19 @@ func (p Program[S]) start(ctx context.Context, o Options, h hooks) (*Report, err
 		next, stopPull := tp.open(r, s)
 		var pull sync.Mutex
 		taken := 0
-		take := func() (func(*Job) error, int, bool) {
+		take := func() (work, int, bool) {
 			pull.Lock()
 			defer pull.Unlock()
 			if core.Stopped() || (o.Jobs > 0 && taken >= o.Jobs) {
-				return nil, 0, false
+				return work{}, 0, false
 			}
-			work, ok := next()
+			wk, ok := next()
 			if !ok || core.Stopped() {
-				return nil, 0, false
+				return work{}, 0, false
 			}
 			taken++
 			r.begin()
-			return work, int(ids.Add(1)), true
+			return wk, int(ids.Add(1)), true
 		}
 		wg.Go(func() {
 			defer stopPull()
@@ -366,19 +382,25 @@ func (p Program[S]) start(ctx context.Context, o Options, h hooks) (*Report, err
 			for w := 1; w <= threads[i]; w++ {
 				tw.Go(func() {
 					for {
-						work, id, ok := take()
+						wk, id, ok := take()
 						if !ok {
 							return
 						}
-						rn.do(info, r, w, id, work)
+						rn.do(info, r, w, id, wk)
 					}
 				})
 			}
 			tw.Wait()
+			if tp.finish != nil {
+				rn.hook(tp.name, "Finish", func() { tp.finish(r, s) })
+			}
 			core.taskDone(r.t)
 		})
 	}
 	wg.Wait()
+	if p.Finish != nil {
+		rn.hook("", "Finish", func() { p.Finish(core.whole(), s) })
+	}
 
 	rep := core.report(runName, runDir)
 	done := map[string]any{"ends": rep.Ends}
@@ -393,12 +415,12 @@ func (p Program[S]) start(ctx context.Context, o Options, h hooks) (*Report, err
 }
 
 // do runs one job and its retries.
-func (rn *runner) do(t *taskInfo, r *Run, worker, id int, work func(*Job) error) {
+func (rn *runner) do(t *taskInfo, r *Run, worker, id int, wk work) {
 	begin := time.Now()
 	for try := 1; ; try++ {
 		j := &Job{Ctx: rn.core.ctx, ID: id, Worker: worker, Try: try, Task: t.name, rn: rn, run: r, ends: t.ends}
 		j.emit(Event{Type: "job"})
-		err := j.call(func() error { return work(j) })
+		err := j.call(func() error { return wk.run(j) })
 		o := rn.judge(j, err)
 		o = rn.release(j, o)
 		if o.again && try <= o.limit && rn.core.ctx.Err() == nil {
@@ -408,7 +430,27 @@ func (rn *runner) do(t *taskInfo, r *Run, worker, id int, work func(*Job) error)
 		if o.again {
 			o = o.gaveUp(t.ends)
 		}
-		rn.end(j, o, try, time.Since(begin))
+		took := time.Since(begin)
+		rn.end(j, o, try, took)
+		if wk.done != nil {
+			res := Result{ID: id, End: o.end, Tone: o.tone, Detail: o.detail, Err: err, Step: j.step, Tries: try, Took: took, ProxyID: j.ProxyID()}
+			rn.hook(t.name, "Done", func() { wk.done(res) }, id)
+		}
 		return
 	}
+}
+
+// hook runs a bot's Done or Finish; a panic in it is logged instead of
+// ending the run.
+func (rn *runner) hook(task, name string, fn func(), job ...int) {
+	defer func() {
+		if p := recover(); p != nil {
+			e := Event{Type: "log", Task: task, Text: fmt.Sprintf("%s panicked: %v\n%s", name, p, debug.Stack())}
+			if len(job) > 0 {
+				e.Job = job[0]
+			}
+			rn.ev.emit(e)
+		}
+	}()
+	fn()
 }

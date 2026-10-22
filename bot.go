@@ -44,9 +44,21 @@ type Bot[S, J any] struct {
 	Workers func(s *S) int
 	// Job does one job. It returns nil after End, or when done without one,
 	// which ends as "done". A job rents a browser only when it uses one.
+	// Every try of a job gets the same item: with a pointer type such as
+	// *Account, what one try changes on it, such as a new password or a
+	// step that's done, is there for the next try and for Done.
 	Job func(j *Job, s *S, item J) error
 	// Ends names the ways a job can end and what each means.
 	Ends Ends
+	// Done hears how each job ended, once, after its last try, with the
+	// item it worked on: e.g. to keep a file of what's still to do, count,
+	// or hand the outcome on. Jobs end on several threads at once, so Done
+	// runs on them too. A job that never started, because the run stopped
+	// first, isn't heard of.
+	Done func(r *Run, s *S, item J, res Result)
+	// Finish runs once when the jobs are over, however the run ended, e.g.
+	// to write a summary; r.Context() is over when the run was canceled.
+	Finish func(r *Run, s *S)
 	// Browser adjusts the config of every browser rented, e.g. its country.
 	Browser func(c *browserscale.BrowserConfig, s *S)
 	// Browsers is how many browsers the jobs have at most at once, for jobs
@@ -70,7 +82,7 @@ func (b Bot[S, J]) program() Program[S] {
 	}
 	return Program[S]{
 		Name: b.Name, Title: b.Title, Settings: b.Settings,
-		Tasks:   []Tasker[S]{Task[S, J]{Jobs: b.Jobs, Threads: threads, Job: b.Job, Ends: b.Ends}},
+		Tasks:   []Tasker[S]{Task[S, J]{Jobs: b.Jobs, Threads: threads, Job: b.Job, Ends: b.Ends, Done: b.Done, Finish: b.Finish}},
 		Browser: b.Browser, Browsers: b.Browsers,
 		Lease: b.Lease, Retries: b.Retries, StopAfter: b.StopAfter,
 	}

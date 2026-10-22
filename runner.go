@@ -1,6 +1,7 @@
 package kit
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -90,13 +91,15 @@ type runner struct {
 	runDir  string
 	key     string
 	proxies *proxies
-	// country is the managed proxies' country, when the run uses them.
-	country   string
-	configure func(*browserscale.BrowserConfig)
-	lease     time.Duration
-	retries   int
-	stopAfter int
-	attached  atomic.Bool
+	// country is the managed proxies' country the setting names, when the
+	// run uses them; botCountry the field's.
+	country    string
+	botCountry string
+	configure  func(*browserscale.BrowserConfig)
+	lease      time.Duration
+	retries    int
+	stopAfter  int
+	attached   atomic.Bool
 	// single is a run of one task; flowed is set once a flow took -from
 	// or -until.
 	single bool
@@ -189,8 +192,8 @@ func (rn *runner) browserFor(j *Job) error {
 		if e != nil && e.e.Masque != "" {
 			cfg.WithMasque(e.e.Masque)
 		}
-		if e == nil && rn.country != "" {
-			cfg.WithCountryCode(strings.ToUpper(rn.country))
+		if cc := cmp.Or(j.proxyParams[proxy.Country], rn.country, j.proxyDefaults[proxy.Country], rn.botCountry); e == nil && cc != "" {
+			cfg.WithCountryCode(strings.ToUpper(cc))
 		}
 		if rn.configure != nil {
 			rn.configure(cfg)
@@ -277,7 +280,14 @@ func (rn *runner) takeProxy(j *Job) (e *proxyEntry, p proxy.Proxy, err error) {
 			j.emit(Event{Type: "log", Text: fmt.Sprintf("proxy %s didn't rotate: %v", e.label(), err)})
 		}
 	}
-	if p, err = e.e.Render(); err != nil {
+	ent, err := rn.proxies.src.WithDefaults(e.e, j.proxyDefaults)
+	if err == nil {
+		ent, err = rn.proxies.src.With(ent, j.proxyParams)
+	}
+	if err != nil {
+		return nil, p, &fatalError{msg: fmt.Sprintf("Job %d sets a proxy parameter: %v.", j.ID, err)}
+	}
+	if p, err = ent.Render(); err != nil {
 		return nil, p, &fatalError{msg: fmt.Sprintf("Proxy %s can't be used: %v.", e.label(), err)}
 	}
 	return e, p, nil

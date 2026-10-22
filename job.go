@@ -52,12 +52,14 @@ type Job struct {
 	attached bool
 	proxy    *proxyEntry
 	// addr is the proxy with its placeholders filled, once the try has one.
-	addr    *proxy.Proxy
-	proxyID string
-	step    string
-	ended   *ending
-	watches []watch
-	until   string
+	addr          *proxy.Proxy
+	proxyID       string
+	proxyParams   map[string]string
+	proxyDefaults map[string]string
+	step          string
+	ended         *ending
+	watches       []watch
+	until         string
 }
 
 type ending struct{ name, detail string }
@@ -147,6 +149,32 @@ func (j *Job) UseProxy(id string) {
 	j.proxyID = id
 }
 
+// ProxyParam sets a parameter of the job's proxy for this try, over the
+// source's value, the bot's and the setting's: by meaning, proxy.Country or
+// proxy.Sticky ("30m"), which works whatever the provider calls the
+// parameter, or by the source's name for it. Call it before the first
+// Proxy, Browser or Page. A meaning the source has no parameter for is left
+// out; managed proxies take proxy.Country.
+func (j *Job) ProxyParam(key, value string) {
+	if j.proxyParams == nil {
+		j.proxyParams = map[string]string{}
+	}
+	j.proxyParams[key] = value
+}
+
+// ProxyDefault sets a parameter of the job's proxy for this try like
+// ProxyParam, but only where the proxies setting gives it no value of its
+// own: over the source's and the bot's, under the user's. E.g. the country
+// of the site a job opens, unless the user picked one. Managed proxies take
+// proxy.Country unless the setting names one (managed:fr). Without a proxy,
+// or in a job that rents no browser and asks for none, it does nothing.
+func (j *Job) ProxyDefault(key, value string) {
+	if j.proxyDefaults == nil {
+		j.proxyDefaults = map[string]string{}
+	}
+	j.proxyDefaults[key] = value
+}
+
 // ProxyID is the id of the job's proxy, or "" when it has none, such as an
 // entry of a plain list.
 func (j *Job) ProxyID() string {
@@ -207,11 +235,15 @@ func (j *Job) Log(format string, args ...any) {
 }
 
 // Save appends record to a file in the run's folder, by default
-// <name>.csv. Structs give one column per exported field, named by a csv tag
-// when there is one; maps one per key. A name with another extension gets
-// the record as a line of text.
-func (j *Job) Save(name string, record any) error {
-	file, err := j.rn.saves.save(name, record)
+// <name>.csv; the name may have folders, such as "pages/de.jsonl". The
+// format is the one given, else the extension's: CSV for .csv (structs give
+// one column per exported field, named by a csv tag when there is one; maps
+// one per key), a tab for .tsv, JSONL for .jsonl, else Text, a line as fmt
+// prints it. The first record written to a file fixes its format, e.g.
+//
+//	j.Save("success.txt", acc, kit.CSV)
+func (j *Job) Save(name string, record any, format ...Format) error {
+	file, err := j.rn.saves.save(name, record, format...)
 	if err != nil {
 		return err
 	}

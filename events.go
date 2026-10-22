@@ -33,7 +33,7 @@ import (
 //	step     the job entered Step
 //	watch    a watched condition matched during Step; Text is where it goes
 //	log      the job logged Text
-//	save     the job saved a record to the file in Text
+//	save     the job, or the bot outside one, wrote to the file in Text
 //	wait     the job waits, Text says for what
 //	retry    the job is tried again, Text says why
 //	end      the job ended as End, of Tone; Text is the detail, Data has

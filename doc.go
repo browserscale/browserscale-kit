@@ -101,8 +101,8 @@
 // # Proxies
 //
 // The proxies setting, a [form.Form.Proxies] field, names a saved source,
-// proxy:<id> or proxy:<id>/<profile>, which Studio keeps in its Proxies tab
-// and points the bot at with BROWSERSCALE_PROXIES; or a list file in data, a
+// proxy:<id>, which Studio keeps in its Proxies tab and points the bot at
+// with BROWSERSCALE_PROXIES; or a list file in data, a
 // source spec (.json), or browserscale's managed proxies ("managed",
 // "managed:de"; also when empty). A source is a list used in turn, a
 // provider gateway written as a template, static addresses with ids, or
@@ -112,8 +112,26 @@
 // The field says what the bot needs of them, and the settings form holds
 // the user's choice against it: Kinds turns other kinds down, while Fresh (a
 // new address for every job's browser), Keeps (an account keeps its address) and Country
-// add a note where a choice doesn't quite fit. Managed proxies get the
-// field's Country unless the setting names one.
+// add a note where a choice doesn't quite fit.
+//
+// A source's parameters, such as a gateway's country or how long a session
+// keeps its address, take their values in layers, each over the one before:
+//
+//  1. the source's own;
+//  2. the bot's: the field's Country, Sticky and Param, and ParamFrom, a
+//     parameter that follows another setting, such as a country setting
+//     that serves other things too;
+//  3. a job's defaults ([Job.ProxyDefault]), e.g. the country of the site
+//     the job opens;
+//  4. the user's, in the setting (proxy:<id>?country=fr&lifetime=30m);
+//  5. a job's own ([Job.ProxyParam]), which nothing overrides.
+//
+// Country and Sticky are meanings, proxy.Country and proxy.Sticky, that
+// find the parameter whatever the provider calls it (cc, region; lifetime,
+// sesstime, ttl, ...), so the code works with any source; one without such
+// a parameter leaves them out. Managed proxies take the country in the same
+// layers, the user's being managed:fr. A bot without proxies, or a job
+// without a browser or requests through one, isn't touched by any of it.
 //
 // How a failed proxy is treated follows its kind:
 //
@@ -128,6 +146,26 @@
 // accounts that keep their address; [Job.ProxyID] says which one the job
 // went through, to remember it with the account.
 //
+// # What a run keeps
+//
+// Every try of a job gets the same item. With a pointer type, such as
+// Bot[Settings, *Account], what one try changes on it, a new password or a
+// step that's done, is there for the next try. What lasts across runs goes
+// into [Job.Store].
+//
+// [Job.Save] and [Run.Save] append a record to a file in the run's folder,
+// in the format given or the extension's: [CSV] with a header line, a tab
+// for .tsv, [JSONL], [Text], [Delimited] for lines like email:password, or
+// a bot's own [Format]. [Run.Rewrite] replaces a file with records, such as
+// what's still to do; [Run.Write] with any data; [Run.Dir] is the folder,
+// for files written another way. Names may have folders, such as
+// "pages/1.html".
+//
+// Bot.Done hears how each job ended after its last try, with its item and a
+// [Result]; Bot.Finish runs once the jobs are over. Jobs runs at the start,
+// so what has to happen first, such as a copy of the input, goes there.
+// None of it is needed: a bot uses what it has a use for.
+//
 // # Files
 //
 //	data/config.json      the settings
@@ -136,7 +174,7 @@
 //	runs/<run>/events.jsonl  everything that happened, one JSON event per line
 //	runs/<run>/settings.json the settings the run went with, without secret ones
 //	runs/<run>/status.csv    one row per job: end, tone, step, detail, task
-//	runs/<run>/<name>.csv    what jobs saved with Job.Save
+//	runs/<run>/*             what the bot saved, rewrote or wrote, by name
 //	runs/<run>/shots/        the page of every job that failed unexpectedly
 //
 // # While developing

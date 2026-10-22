@@ -378,8 +378,8 @@ func buildWidget(f *form.Field, filesDirectory string) (huh.Field, error) {
 		if f.FileTag == form.TagProxies {
 			for _, s := range proxy.ListSaved() {
 				opts = append(opts, huh.NewOption(fmt.Sprintf("%s (saved %s)", s.Name, s.Kind), s.Ref))
-				for _, p := range s.Profiles {
-					opts = append(opts, huh.NewOption(fmt.Sprintf("%s / %s (saved %s)", s.Name, p, s.Kind), s.Ref+"/"+p))
+				if cur := *ptr; cur != s.Ref && strings.HasPrefix(cur, s.Ref+"?") {
+					opts = append(opts, huh.NewOption(fmt.Sprintf("%s with %s (saved %s)", s.Name, strings.SplitN(cur, "?", 2)[1], s.Kind), cur))
 				}
 			}
 		}

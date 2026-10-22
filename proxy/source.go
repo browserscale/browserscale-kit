@@ -39,8 +39,19 @@ const (
 )
 
 // RefPrefix starts a reference to a saved source instead of a file name:
-// proxy:<id> or proxy:<id>/<profile>.
+// proxy:<id>, or with values for its parameters proxy:<id>?country=fr&lifetime=30m.
 const RefPrefix = "proxy:"
+
+// The meanings a source's parameter can have. A bot asks for them without
+// knowing what the provider calls the parameter (country, cc, region;
+// lifetime, sesstime, ttl, ...); a source without one leaves it out.
+const (
+	// Country is the exit country, a two-letter code.
+	Country = "country"
+	// Sticky is how long a session keeps its exit address, a duration
+	// like "15m", written the way the source writes its value.
+	Sticky = "sticky"
+)
 
 // SourcesEnv names the directory saved sources are read from. Studio sets it
 // for the bots it runs.
@@ -51,8 +62,8 @@ const defaultRotateWait = 10 * time.Second
 // Spec is a source as it's saved, a JSON file:
 //
 //	{"kind": "gateway", "name": "Residential",
-//	 "template": "gw.example.com:7000:user:pass_country-{country}_session-{session}",
-//	 "params": {"country": "de"}, "profiles": {"us": {"country": "us"}}}
+//	 "template": "gw.example.com:7000:user:pass_country-{country}_session-{session}_lifetime-{lifetime}",
+//	 "params": {"country": "de", "lifetime": "10m"}}
 //
 // Lines, entries and the template may hold placeholders, filled for every
 // browser: {session} (a new random id, {session:8} for 8 characters),
@@ -69,9 +80,14 @@ type Spec struct {
 	// it the same exit address, so a session id rather than one that
 	// rotates on every connection. Without it HTTP/3 falls back to TCP.
 	Masque string `json:"masque,omitempty"`
-	// Params are the values for the template's {name} placeholders;
-	// Profiles are named sets that change some of them.
-	Params   map[string]string            `json:"params,omitempty"`
+	// Params are the default values for the {name} placeholders.
+	Params map[string]string `json:"params,omitempty"`
+	// Roles say what a parameter means when its name doesn't tell: name to
+	// Country or Sticky. A Sticky value without a unit counts in minutes;
+	// "sticky:s" or "sticky:h" say seconds or hours.
+	Roles map[string]string `json:"roles,omitempty"`
+	// Profiles are named sets of parameters that older references
+	// (proxy:<id>/<profile>) pick.
 	Profiles map[string]map[string]string `json:"profiles,omitempty"`
 	// Lines and File hold a list's proxies; File is relative to the spec.
 	Lines []string `json:"lines,omitempty"`
@@ -96,23 +112,176 @@ type Source struct {
 	Kind    string
 	Name    string
 	Entries []Entry
-	// Params are the template's parameters with the profile's applied.
+	// Params are the parameters' values for the run: the spec's, then the
+	// bot's, then the setting's.
 	Params map[string]string
 	// Skipped counts a list's lines that aren't proxies.
 	Skipped int
+
+	// names are the parameters the source has; roles the ones with a
+	// meaning, by meaning; set the ones the setting gave a value.
+	names map[string]bool
+	roles map[string]role
+	set   map[string]bool
 }
 
-// countryParams are the parameter names providers give the exit country.
-var countryParams = []string{"country", "cc", "countrycode", "country_code", "region"}
+// role is the parameter a meaning maps to and how its values are written.
+type role struct {
+	name string
+	// unit and suffix write a Sticky duration: minutes and "m" for "15m".
+	unit   time.Duration
+	suffix string
+	upper  bool
+}
+
+// The parameter names providers give a meaning.
+var (
+	countryParams = []string{"country", "cc", "countrycode", "country_code", "region"}
+	stickyParams  = []string{"lifetime", "sesstime", "sessiontime", "sessionduration", "session_duration", "sessttl", "ttl", "sticky", "stickytime"}
+)
+
+var durationValue = regexp.MustCompile(`^(\d+)\s*([a-zA-Z]*)$`)
+
+// roleOf finds the parameter for meaning among names: one Roles maps to it,
+// else one named as providers name it.
+func (s Spec) roleOf(meaning string, names map[string]bool) (role, bool) {
+	var r role
+	for n, m := range s.Roles {
+		base, unit, _ := strings.Cut(m, ":")
+		if base == meaning && names[n] {
+			r.name = n
+			r.unit = map[string]time.Duration{"s": time.Second, "h": time.Hour}[unit]
+			break
+		}
+	}
+	if r.name == "" {
+		known := countryParams
+		if meaning == Sticky {
+			known = stickyParams
+		}
+		for _, k := range known {
+			for n := range names {
+				if strings.EqualFold(n, k) && s.Roles[n] == "" {
+					r.name = n
+				}
+			}
+			if r.name != "" {
+				break
+			}
+		}
+	}
+	if r.name == "" {
+		return r, false
+	}
+	v := s.Params[r.name]
+	if meaning == Country {
+		r.upper = v != "" && v == strings.ToUpper(v)
+		return r, true
+	}
+	if m := durationValue.FindStringSubmatch(v); m != nil {
+		r.suffix = m[2]
+		if r.unit == 0 {
+			switch strings.ToLower(m[2]) {
+			case "s", "sec":
+				r.unit = time.Second
+			case "h":
+				r.unit = time.Hour
+			}
+		}
+	}
+	if r.unit == 0 {
+		r.unit = time.Minute
+	}
+	return r, true
+}
+
+// write is value as the parameter takes it.
+func (r role) write(meaning, value string) string {
+	switch meaning {
+	case Country:
+		if r.upper {
+			return strings.ToUpper(value)
+		}
+		return strings.ToLower(value)
+	case Sticky:
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return value
+		}
+		n := (d + r.unit - 1) / r.unit
+		return strconv.FormatInt(int64(n), 10) + r.suffix
+	}
+	return value
+}
+
+// resolve is the parameter key stands for, a meaning or a name, with value
+// written for it. ok is false when the source has no such parameter.
+func (s *Source) resolve(key, value string) (name, v string, ok bool) {
+	if r, has := s.roles[key]; has {
+		return r.name, r.write(key, value), true
+	}
+	if key == Country || key == Sticky || !s.names[key] {
+		return "", "", false
+	}
+	return key, value, true
+}
+
+// Has reports whether the source has a parameter for key, a meaning
+// (Country, Sticky) or a name.
+func (s *Source) Has(key string) bool {
+	_, _, ok := s.resolve(key, "")
+	return ok
+}
+
+// ParamName is the parameter a meaning maps to, or "" when the source has
+// none.
+func (s *Source) ParamName(meaning string) string { return s.roles[meaning].name }
+
+// With is e with some parameters changed, by meaning or by name, e.g. for
+// one job. A meaning the source has no parameter for is left out; an
+// unknown name is an error.
+func (s *Source) With(e Entry, values map[string]string) (Entry, error) {
+	if len(values) == 0 {
+		return e, nil
+	}
+	params := make(map[string]string, len(e.params)+len(values))
+	for k, v := range e.params {
+		params[k] = v
+	}
+	for _, k := range sortedKeys(values) {
+		name, v, ok := s.resolve(k, values[k])
+		if !ok {
+			if k == Country || k == Sticky {
+				continue
+			}
+			return e, fmt.Errorf("the proxy source has no parameter %q%s", k, list(s.names))
+		}
+		params[name] = v
+	}
+	e.params = params
+	return e, nil
+}
+
+// WithDefaults is e with some parameters changed like With, but only those
+// the setting gave no value: defaults of a job's, which the user's choice
+// wins over.
+func (s *Source) WithDefaults(e Entry, values map[string]string) (Entry, error) {
+	keep := map[string]string{}
+	for k, v := range values {
+		if name, _, ok := s.resolve(k, v); ok && s.set[name] {
+			continue
+		}
+		keep[k] = v
+	}
+	return s.With(e, keep)
+}
 
 // Country is the exit country the source's parameters ask for, lower case,
 // or "" when they don't say.
 func (s *Source) Country() string {
-	for k, v := range s.Params {
-		for _, n := range countryParams {
-			if strings.EqualFold(k, n) && len(v) == 2 {
-				return strings.ToLower(v)
-			}
+	if r, ok := s.roles[Country]; ok {
+		if v := s.Params[r.name]; len(v) == 2 {
+			return strings.ToLower(v)
 		}
 	}
 	return ""
@@ -350,65 +519,111 @@ var refID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 // IsRef reports whether a file setting's value refers to a saved source.
 func IsRef(value string) bool { return strings.HasPrefix(value, RefPrefix) }
 
-// ParseRef splits proxy:<id>[/<profile>].
-func ParseRef(value string) (id, profile string, err error) {
-	rest, ok := strings.CutPrefix(value, RefPrefix)
+// Ref is a reference to a saved source: proxy:<id>?<name>=<value>&...
+type Ref struct {
+	ID string
+	// Params are the setting's values for the source's parameters, by name
+	// or by meaning (Country, Sticky). They win over the source's and the
+	// bot's.
+	Params map[string]string
+	// Profile is an older reference's named set, proxy:<id>/<profile>.
+	Profile string
+}
+
+// ParseRef reads proxy:<id>[?<name>=<value>&...].
+func ParseRef(value string) (Ref, error) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(value), RefPrefix)
 	if !ok {
-		return "", "", fmt.Errorf("%q isn't a proxy source reference", value)
+		return Ref{}, fmt.Errorf("%q isn't a proxy source reference", value)
 	}
-	id, profile, _ = strings.Cut(rest, "/")
-	if !refID.MatchString(id) {
-		return "", "", fmt.Errorf("%q isn't a proxy source id", id)
+	rest, query, _ := strings.Cut(rest, "?")
+	var r Ref
+	r.ID, r.Profile, _ = strings.Cut(rest, "/")
+	if !refID.MatchString(r.ID) {
+		return Ref{}, fmt.Errorf("%q isn't a proxy source id", r.ID)
 	}
-	return id, profile, nil
+	if query != "" {
+		q, err := url.ParseQuery(query)
+		if err != nil {
+			return Ref{}, fmt.Errorf("the parameters of %s aren't name=value&...: %v", value, err)
+		}
+		r.Params = map[string]string{}
+		for k, v := range q {
+			r.Params[k] = v[len(v)-1]
+		}
+	}
+	return r, nil
+}
+
+// String writes r back as a reference, its parameters sorted by name.
+func (r Ref) String() string {
+	s := RefPrefix + r.ID
+	if r.Profile != "" {
+		s += "/" + r.Profile
+	}
+	if len(r.Params) > 0 {
+		q := make([]string, 0, len(r.Params))
+		for _, k := range sortedKeys(r.Params) {
+			q = append(q, url.QueryEscape(k)+"="+url.QueryEscape(r.Params[k]))
+		}
+		s += "?" + strings.Join(q, "&")
+	}
+	return s
 }
 
 // SourcesDir is where saved sources are, from SourcesEnv.
 func SourcesDir() string { return os.Getenv(SourcesEnv) }
 
 // Path is the file a proxies setting reads: a file in dataDir (or an
-// absolute path), or for proxy:<id> the saved source's spec. profile is the
-// reference's profile.
-func Path(dataDir, value string) (path, profile string, err error) {
+// absolute path), or for proxy:<id> the saved source's spec. ref is the
+// parsed reference, empty for a file.
+func Path(dataDir, value string) (path string, ref Ref, err error) {
 	if !IsRef(value) {
 		if filepath.IsAbs(value) || dataDir == "" {
-			return value, "", nil
+			return value, Ref{}, nil
 		}
-		return filepath.Join(dataDir, value), "", nil
+		return filepath.Join(dataDir, value), Ref{}, nil
 	}
-	id, profile, err := ParseRef(value)
+	ref, err = ParseRef(value)
 	if err != nil {
-		return "", "", err
+		return "", Ref{}, err
 	}
 	dir := SourcesDir()
 	if dir == "" {
-		return "", "", fmt.Errorf("%s names a saved proxy source, but %s doesn't say where they're kept; run the bot from Studio or set it", value, SourcesEnv)
+		return "", Ref{}, fmt.Errorf("%s names a saved proxy source, but %s doesn't say where they're kept; run the bot from Studio or set it", value, SourcesEnv)
 	}
-	return filepath.Join(dir, id+".json"), profile, nil
+	return filepath.Join(dir, ref.ID+".json"), ref, nil
 }
 
 // Open reads the source a proxies setting names: a list file, a spec file
-// (.json), or a saved source by reference.
-func Open(dataDir, value string) (*Source, error) {
-	path, profile, err := Path(dataDir, value)
+// (.json), or a saved source by reference. wants are the bot's own values
+// for its parameters, by meaning (Country, Sticky) or by name: they win
+// over the source's, and the reference's win over them. One the source has
+// no parameter for is left out.
+func Open(dataDir, value string, wants ...map[string]string) (*Source, error) {
+	path, ref, err := Path(dataDir, value)
 	if err != nil {
 		return nil, err
+	}
+	var want map[string]string
+	if len(wants) > 0 {
+		want = wants[0]
 	}
 	if !strings.EqualFold(filepath.Ext(path), ".json") {
 		lines, err := input.NonEmptyLines(path)
 		if err != nil {
 			return nil, err
 		}
-		return Spec{Kind: KindList, Lines: lines}.Source(profile, filepath.Dir(path))
+		return Spec{Kind: KindList, Lines: lines}.Source(filepath.Dir(path), ref, want)
 	}
 	spec, err := ReadSpec(path)
 	if err != nil {
 		if IsRef(value) && errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("there's no saved proxy source %s", strings.TrimPrefix(value, RefPrefix))
+			return nil, fmt.Errorf("there's no saved proxy source %s", ref.ID)
 		}
 		return nil, err
 	}
-	return spec.Source(profile, filepath.Dir(path))
+	return spec.Source(filepath.Dir(path), ref, want)
 }
 
 // ReadSpec reads a spec file.
@@ -424,23 +639,78 @@ func ReadSpec(path string) (Spec, error) {
 	return s, nil
 }
 
-// Source builds the run's entries with profile's parameters. dir is where a
-// list's File is.
-func (s Spec) Source(profile, dir string) (*Source, error) {
+// Source builds the run's entries. Their parameters are the spec's, then
+// wants, the bot's, then the reference's; see Open. dir is where a list's
+// File is.
+func (s Spec) Source(dir string, ref Ref, wants map[string]string) (*Source, error) {
+	var lines []string
+	if s.Kind == KindList || s.Kind == "" {
+		lines = s.Lines
+		if s.File != "" {
+			fl, err := input.NonEmptyLines(filepath.Join(dir, filepath.Base(s.File)))
+			if err != nil {
+				return nil, err
+			}
+			lines = append(append([]string(nil), lines...), fl...)
+		}
+	}
+	src := &Source{Kind: s.Kind, Name: s.Name, names: map[string]bool{}, roles: map[string]role{}, set: map[string]bool{}}
+	for k := range s.Params {
+		src.names[k] = true
+	}
+	placeholders := func(line string) {
+		for _, n := range Placeholders(line) {
+			if n != "session" && n != "port" {
+				src.names[n] = true
+			}
+		}
+	}
+	placeholders(s.Template)
+	for _, e := range s.Entries {
+		placeholders(e.Line)
+	}
+	if len(lines) <= 1000 {
+		for _, l := range lines {
+			placeholders(l)
+		}
+	}
+	for _, m := range []string{Country, Sticky} {
+		if r, ok := s.roleOf(m, src.names); ok {
+			src.roles[m] = r
+		}
+	}
+
 	params := map[string]string{}
 	for k, v := range s.Params {
 		params[k] = v
 	}
-	if profile != "" {
-		p, ok := s.Profiles[profile]
+	if ref.Profile != "" {
+		p, ok := s.Profiles[ref.Profile]
 		if !ok {
-			return nil, fmt.Errorf("the proxy source has no profile %q%s", profile, names(s.Profiles))
+			return nil, fmt.Errorf("the proxy source has no profile %q%s", ref.Profile, names(s.Profiles))
 		}
 		for k, v := range p {
 			params[k] = v
 		}
 	}
-	src := &Source{Kind: s.Kind, Name: s.Name, Params: params}
+	for _, k := range sortedKeys(wants) {
+		if name, v, ok := src.resolve(k, wants[k]); ok {
+			params[name] = v
+		}
+	}
+	for _, k := range sortedKeys(ref.Params) {
+		name, v, ok := src.resolve(k, ref.Params[k])
+		if !ok {
+			if k == Country || k == Sticky {
+				continue
+			}
+			return nil, fmt.Errorf("the proxy source has no parameter %q%s", k, list(src.names))
+		}
+		params[name] = v
+		src.set[name] = true
+	}
+	src.Params = params
+
 	wait := defaultRotateWait
 	if s.RotateWaitMs > 0 {
 		wait = time.Duration(s.RotateWaitMs) * time.Millisecond
@@ -457,14 +727,6 @@ func (s Spec) Source(profile, dir string) (*Source, error) {
 	switch s.Kind {
 	case KindList, "":
 		src.Kind = KindList
-		lines := s.Lines
-		if s.File != "" {
-			fl, err := input.NonEmptyLines(filepath.Join(dir, filepath.Base(s.File)))
-			if err != nil {
-				return nil, err
-			}
-			lines = append(append([]string(nil), lines...), fl...)
-		}
 		for _, l := range lines {
 			l = strings.TrimSpace(l)
 			if l == "" || strings.HasPrefix(l, "#") {
@@ -538,6 +800,27 @@ func names(m map[string]map[string]string) string {
 	return " (it has " + strings.Join(out, ", ") + ")"
 }
 
+func list(set map[string]bool) string {
+	if len(set) == 0 {
+		return "; it has none"
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return " (it has " + strings.Join(out, ", ") + ")"
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func or(a, b string) string {
 	if a != "" {
 		return a
@@ -547,10 +830,10 @@ func or(a, b string) string {
 
 // Saved is a saved source as a picker shows it.
 type Saved struct {
-	Ref      string
-	Name     string
-	Kind     string
-	Profiles []string
+	Ref    string
+	Name   string
+	Kind   string
+	Params map[string]string
 }
 
 // ListSaved lists the saved sources in SourcesDir.
@@ -570,12 +853,7 @@ func ListSaved() []Saved {
 		if err != nil {
 			continue
 		}
-		sv := Saved{Ref: RefPrefix + id, Name: or(s.Name, id), Kind: or(s.Kind, KindList)}
-		for p := range s.Profiles {
-			sv.Profiles = append(sv.Profiles, p)
-		}
-		sort.Strings(sv.Profiles)
-		out = append(out, sv)
+		out = append(out, Saved{Ref: RefPrefix + id, Name: or(s.Name, id), Kind: or(s.Kind, KindList), Params: s.Params})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out

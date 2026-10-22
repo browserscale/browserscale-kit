@@ -1,5 +1,14 @@
 package form
 
+import (
+	"fmt"
+	"maps"
+	"strconv"
+	"strings"
+
+	"github.com/browserscale/browserscale-kit/proxy"
+)
+
 // Kind is the canonical type of a form field.
 type Kind string
 
@@ -52,8 +61,101 @@ type ProxyRule struct {
 	// Address is AddressFresh, AddressKeep or "" for either.
 	Address string `json:"address,omitempty"`
 	// Country is the exit country the site needs, e.g. "de". Managed
-	// proxies get it unless the setting names another.
+	// proxies and a source with a country parameter get it unless the
+	// setting names another.
 	Country string `json:"country,omitempty"`
+	// Sticky is how long a browser needs to keep its exit address, a
+	// duration like "15m"; a source with a parameter for it gets it.
+	Sticky string `json:"sticky,omitempty"`
+	// Params are the bot's values for source parameters by name, such as a
+	// provider's zone; a source without the parameter leaves it out.
+	Params map[string]string `json:"params,omitempty"`
+	// From are parameters that follow another setting of the form: by
+	// meaning or name, the field whose value they take. The field's value,
+	// while it shows and isn't empty, takes the place of the bot's own.
+	From map[string]string `json:"from,omitempty"`
+
+	// value reads another field of the form while it shows, for From.
+	value func(field string) any
+}
+
+// Wants are the rule's values for a source's parameters, by meaning
+// (proxy.Country, proxy.Sticky) and by name, as proxy.Open takes them:
+// the bot's own, and over them the settings From names.
+func (r *ProxyRule) Wants() map[string]string {
+	if r == nil {
+		return nil
+	}
+	w := map[string]string{}
+	for k, v := range r.Params {
+		w[k] = v
+	}
+	if r.Country != "" {
+		w[proxy.Country] = r.Country
+	}
+	if r.Sticky != "" {
+		w[proxy.Sticky] = r.Sticky
+	}
+	if r.value != nil {
+		for k, field := range r.From {
+			if v := fromValue(k, r.value(field)); v != "" {
+				w[k] = v
+			}
+		}
+	}
+	return w
+}
+
+// fromValue writes a field's value for a parameter: a number of minutes
+// for proxy.Sticky as "15m", a country in lower case.
+func fromValue(key string, v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		s := strings.TrimSpace(x)
+		if key == proxy.Country {
+			s = strings.ToLower(s)
+		}
+		return s
+	case bool:
+		return ""
+	}
+	if f, ok := numericToFloat(v); ok {
+		if f <= 0 {
+			return ""
+		}
+		s := strconv.FormatFloat(f, 'f', -1, 64)
+		if key == proxy.Sticky {
+			s += "m"
+		}
+		return s
+	}
+	return fmt.Sprint(v)
+}
+
+// Current is the rule with the values From takes filled in, as the form
+// stands: what a run gets, for showing it.
+func (r *ProxyRule) Current() *ProxyRule {
+	if r == nil || len(r.From) == 0 {
+		return r
+	}
+	c := *r
+	c.Params = maps.Clone(r.Params)
+	for k, v := range r.Wants() {
+		switch k {
+		case proxy.Country:
+			c.Country = v
+		case proxy.Sticky:
+			c.Sticky = v
+		default:
+			if c.Params == nil {
+				c.Params = map[string]string{}
+			}
+			c.Params[k] = v
+		}
+	}
+	return &c
 }
 
 // SelectOption is one choice in a Select field.

@@ -212,3 +212,34 @@ func TestServeReloadsARelativeConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestServeShowsProxyValuesFromOtherFields(t *testing.T) {
+	dir := t.TempDir()
+	s := &struct {
+		Country string `json:"country"`
+		Proxies string `json:"proxies"`
+	}{}
+	f := form.New("t", "Test", s)
+	f.String("country", &s.Country)
+	f.Proxies("proxies", &s.Proxies).Country("us").ParamFrom("country", "country")
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	go func() {
+		_ = Serve(f.Build(), filepath.Join(dir, "config.json"), dir, inR, outW)
+		outW.Close()
+	}()
+	sc := bufio.NewScanner(outR)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	t.Cleanup(func() { inW.Close() })
+	srv := &served{in: inW, lines: sc}
+
+	if p := field(srv.next(t), "proxies").Proxies; p == nil || p.Country != "us" || p.From["country"] != "country" {
+		t.Fatalf("start: %+v", p)
+	}
+	if p := field(srv.send(t, 1, map[string]any{"country": "FR"}), "proxies").Proxies; p.Country != "fr" {
+		t.Fatalf("after country: %+v", p)
+	}
+	if s.Country != "FR" {
+		t.Fatalf("bound value %q", s.Country)
+	}
+}

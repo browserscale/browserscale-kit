@@ -274,7 +274,7 @@ func ValidateFileField(filesDirectory, fileName, tag string) string {
 func CheckProxies(filesDirectory, value string, rule *ProxyRule) (problem, note string) {
 	var r ProxyRule
 	if rule != nil {
-		r = *rule
+		r = *rule.Current()
 	}
 	if cc, ok := proxy.Managed(value); ok {
 		switch {
@@ -294,7 +294,7 @@ func CheckProxies(filesDirectory, value string, rule *ProxyRule) (problem, note 
 	if msg := ValidateFileField(filesDirectory, value, TagProxies); msg != "" {
 		return msg, ""
 	}
-	src, err := proxy.Open(filesDirectory, value)
+	src, err := proxy.Open(filesDirectory, value, rule.Wants())
 	if err != nil {
 		return err.Error(), ""
 	}

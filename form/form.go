@@ -110,9 +110,12 @@ func (f *Form) File(name string, ptr *string) *FileField {
 }
 
 // Proxies adds the run's proxies setting bound to *ptr: a saved source
-// (proxy:<id>, proxy:<id>/<profile>), a proxy file in the files directory,
-// or browserscale's managed proxies ("managed", "managed:de"; also when
-// empty). Kinds, Fresh, Keeps and Country say what the bot needs of them.
+// (proxy:<id>, with values for its parameters proxy:<id>?country=fr), a
+// proxy file in the files directory, or browserscale's managed proxies
+// ("managed", "managed:de"; also when empty). Kinds, Fresh and Keeps say
+// what the bot needs of them; Country, Sticky and Param are its own values
+// for the source's parameters, and ParamFrom takes one from another
+// setting; the proxies setting's own values win over them.
 func (f *Form) Proxies(name string, ptr *string) *ProxiesField {
 	b := newProxiesField(f, name, ptr)
 	f.add(b.f)

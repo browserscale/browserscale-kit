@@ -3,7 +3,9 @@ package form
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Each typed FieldBuilder wraps a *Field and the parent *Form (so it can
@@ -454,7 +456,12 @@ type ProxiesField struct {
 func newProxiesField(form *Form, name string, ptr *string) *ProxiesField {
 	b := newFileField(form, name, ptr)
 	b.f.FileTag = TagProxies
-	b.f.Proxies = &ProxyRule{}
+	b.f.Proxies = &ProxyRule{value: func(field string) any {
+		if f := form.findField(field); f != nil && f.Visible() {
+			return f.Get()
+		}
+		return nil
+	}}
 	return &ProxiesField{f: b.f, form: form}
 }
 
@@ -480,9 +487,47 @@ func (b *ProxiesField) Fresh() *ProxiesField { b.f.Proxies.Address = AddressFres
 func (b *ProxiesField) Keeps() *ProxiesField { b.f.Proxies.Address = AddressKeep; return b }
 
 // Country is the exit country the site needs, e.g. "de". Managed proxies
-// get it, and a source asking for another gets a note.
+// and a source with a country parameter get it unless the setting names
+// another, which gets a note.
 func (b *ProxiesField) Country(cc string) *ProxiesField {
 	b.f.Proxies.Country = strings.ToLower(cc)
+	return b
+}
+
+// Sticky is how long a browser needs to keep its exit address, e.g. 15
+// minutes for a signup; a source with a parameter for it, whatever the
+// provider calls it, gets it unless the setting names another.
+func (b *ProxiesField) Sticky(d time.Duration) *ProxiesField {
+	s := d.String()
+	if d%time.Minute == 0 {
+		s = strconv.Itoa(int(d/time.Minute)) + "m"
+	}
+	b.f.Proxies.Sticky = s
+	return b
+}
+
+// Param is the bot's value for a source parameter by its name, such as a
+// provider's zone; the setting can name another, and a source without the
+// parameter leaves it out.
+func (b *ProxiesField) Param(name, value string) *ProxiesField {
+	if b.f.Proxies.Params == nil {
+		b.f.Proxies.Params = map[string]string{}
+	}
+	b.f.Proxies.Params[name] = value
+	return b
+}
+
+// ParamFrom makes a source parameter follow another setting of the form,
+// by meaning (proxy.Country, proxy.Sticky) or by name: e.g. a country
+// setting that also serves managed proxies and other things. The field's
+// value, while it shows and isn't empty, is the bot's for the parameter; a
+// number for proxy.Sticky counts minutes. The proxies setting can still
+// name another, and a job's own wins as always.
+func (b *ProxiesField) ParamFrom(key, field string) *ProxiesField {
+	if b.f.Proxies.From == nil {
+		b.f.Proxies.From = map[string]string{}
+	}
+	b.f.Proxies.From[key] = field
 	return b
 }
 

@@ -24,6 +24,10 @@ type runCore struct {
 	cancel  context.CancelFunc
 	dataDir string
 	onStop  func(reason string)
+	// runDir is the run's folder, out writes its files, emit reports.
+	runDir string
+	out    *saver
+	emit   func(Event)
 
 	mu      sync.Mutex
 	change  chan struct{}
@@ -93,6 +97,49 @@ func (r *Run) File(name string) string {
 		return name
 	}
 	return filepath.Join(r.c.dataDir, name)
+}
+
+// Dir is the run's folder, for files a bot writes its own way, such as
+// pictures or a database; Save, Rewrite and Write cover most.
+func (r *Run) Dir() string { return r.c.runDir }
+
+// Save appends record to a file in the run's folder as Job.Save does, e.g.
+// from Jobs at the start of the run or from Done.
+func (r *Run) Save(name string, record any, format ...Format) error {
+	file, err := r.c.out.save(name, record, format...)
+	if err != nil {
+		return err
+	}
+	r.c.emit(Event{Type: "save", Task: r.t.name, Text: file})
+	return nil
+}
+
+// Rewrite replaces a file in the run's folder with records, a slice, in a
+// format as Save writes them, header and all; a later Save goes on after
+// them. E.g. what's still to do, after every job:
+//
+//	r.Rewrite("remaining.csv", s.left())
+//
+// The file is never seen half written.
+func (r *Run) Rewrite(name string, records any, format ...Format) error {
+	file, err := r.c.out.rewrite(name, records, format...)
+	if err != nil {
+		return err
+	}
+	r.c.emit(Event{Type: "save", Task: r.t.name, Text: file})
+	return nil
+}
+
+// Write replaces a file in the run's folder with data, such as a report or
+// a page's HTML; the name may have folders. The file is never seen half
+// written.
+func (r *Run) Write(name string, data []byte) error {
+	file, err := r.c.out.write(name, data)
+	if err != nil {
+		return err
+	}
+	r.c.emit(Event{Type: "save", Task: r.t.name, Text: file})
+	return nil
 }
 
 // Count is how many of the task's jobs ended with one of these names.
@@ -361,6 +408,37 @@ func (r *Run) finish(end string, tone Tone, step string, limit int) bool {
 	}
 	r.c.notify()
 	return s.n > 0 && limit > 0 && s.n == limit
+}
+
+// whole is the run as a whole, once its tasks are over: Count, Ended and
+// Started go by the jobs of all of them.
+func (c *runCore) whole() *Run {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return &Run{c: c, t: &taskState{counts: counts{ends: maps.Clone(c.all.ends), tones: maps.Clone(c.all.tones), started: c.all.started, running: c.all.running}, done: true}}
+}
+
+// Result is how a job ended after its last try, for a bot's Done.
+type Result struct {
+	// ID is the job's, as in its events.
+	ID int
+	// End is the name it ended with, such as "done", "blocked" or
+	// "gave_up"; Tone how that reads; Detail what was said with it, such as
+	// an error's text.
+	End    string
+	Tone   Tone
+	Detail string
+	// Err is what the last try returned; nil when it returned nil, e.g.
+	// after End.
+	Err error
+	// Step is the step it was at, Tries how often it ran, Took how long all
+	// of them took.
+	Step  string
+	Tries int
+	Took  time.Duration
+	// ProxyID is the id of the proxy the last try went through, "" for one
+	// without, such as an entry of a plain list.
+	ProxyID string
 }
 
 // Report is how a run went.
