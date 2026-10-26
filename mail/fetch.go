@@ -45,7 +45,7 @@ func (c *IMAPClient) FetchHeaders(emailUIDs []string) ([]EmailHeaders, error) {
 	messageSet := strings.Join(emailUIDs, ",")
 
 	// Send UID FETCH command to get headers and INTERNALDATE
-	command := fmt.Sprintf("A012 UID FETCH %s (ENVELOPE INTERNALDATE)\r\n", messageSet)
+	command := fmt.Sprintf("A012 UID FETCH %s (UID ENVELOPE INTERNALDATE)\r\n", messageSet)
 	if err := c.sendCommand(command); err != nil {
 		return nil, err
 	}
@@ -64,7 +64,18 @@ func (c *IMAPClient) FetchHeaders(emailUIDs []string) ([]EmailHeaders, error) {
 	// Parse email headers from data responses
 	var headers []EmailHeaders
 	for _, response := range dataResponses {
-		c.parseSingleEmailResponse(response, &headers)
+		msg, ok := c.parseFetchedMessage(response)
+		if !ok {
+			continue
+		}
+		headers = append(headers, EmailHeaders{
+			UID:          msg.uid,
+			Subject:      msg.envelope.Subject,
+			From:         msg.envelope.From,
+			To:           msg.envelope.To,
+			Date:         msg.envelope.Date,
+			InternalDate: msg.internalDate,
+		})
 	}
 
 	return headers, nil
@@ -77,14 +88,14 @@ func (c *IMAPClient) FetchMail(uid string) (*Mail, error) {
 	}
 
 	// Fetch the full raw message so MIME parts can be parsed with the standard library.
-	command := fmt.Sprintf("A013 UID FETCH %s (ENVELOPE INTERNALDATE BODY[])\r\n", uid)
+	command := fmt.Sprintf("A013 UID FETCH %s (UID ENVELOPE INTERNALDATE BODY[])\r\n", uid)
 	if err := c.sendCommand(command); err != nil {
 		return nil, err
 	}
 
-	// Read responses manually to handle BODY[] literal data
+	// readResponse returns each FETCH response whole, BODY[] literal included.
 	var mail *Mail
-	var rawMessage strings.Builder
+	var rawBody string
 
 	for {
 		response, err := c.readResponse()
@@ -92,33 +103,34 @@ func (c *IMAPClient) FetchMail(uid string) (*Mail, error) {
 			return nil, err
 		}
 
-		// Check if this is the end of the fetch response
-		if strings.Contains(response, "A013 OK") {
-			break
-		}
-		if strings.Contains(response, "A013 NO") || strings.Contains(response, "A013 BAD") {
+		// Only the tagged completion starts with the tag; the message body can
+		// contain the same text.
+		if strings.HasPrefix(response, "A013 ") {
+			if strings.HasPrefix(response, "A013 OK") {
+				break
+			}
 			return nil, fmt.Errorf("fetch mail command failed: %s", response)
 		}
 
-		// Parse headers and body from the assembled FETCH response.
-		if strings.Contains(response, "UID") && strings.Contains(response, "INTERNALDATE") && strings.Contains(response, "ENVELOPE") {
-			mail = c.parseSingleMailResponse(response)
+		msg, ok := c.parseFetchedMessage(response)
+		if !ok || msg.uid != uid {
+			continue
 		}
-
-		bodyChunk, hasBody, err := extractFetchLiteral(response, "BODY[] {")
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse body content: %v", err)
+		mail = &Mail{
+			UID:          msg.uid,
+			Subject:      msg.envelope.Subject,
+			From:         msg.envelope.From,
+			To:           msg.envelope.To,
+			Date:         msg.envelope.Date,
+			InternalDate: msg.internalDate,
 		}
-		if hasBody {
-			rawMessage.WriteString(bodyChunk)
-		}
+		rawBody = msg.body
 	}
 
 	if mail == nil {
 		return nil, fmt.Errorf("failed to parse mail for UID %s", uid)
 	}
 
-	rawBody := rawMessage.String()
 	decodedBody, err := extractSearchableBody(rawBody)
 	if err != nil || decodedBody == "" {
 		// Fall back to the raw message so callers can still attempt a regex match.
@@ -128,41 +140,6 @@ func (c *IMAPClient) FetchMail(uid string) (*Mail, error) {
 	}
 
 	return mail, nil
-}
-
-func extractFetchLiteral(response string, bodyMarker string) (string, bool, error) {
-	bodyStart := strings.Index(response, bodyMarker)
-	if bodyStart == -1 {
-		return "", false, nil
-	}
-
-	lengthStart := bodyStart + len(bodyMarker)
-	lengthEnd := strings.Index(response[lengthStart:], "}")
-	if lengthEnd == -1 {
-		return "", false, fmt.Errorf("missing fetch literal terminator")
-	}
-	lengthEnd += lengthStart
-
-	bodyLength, err := strconv.Atoi(response[lengthStart:lengthEnd])
-	if err != nil {
-		return "", false, fmt.Errorf("invalid fetch literal length: %w", err)
-	}
-
-	bodyOffset := lengthEnd + 1
-	switch {
-	case strings.HasPrefix(response[bodyOffset:], "\r\n"):
-		bodyOffset += 2
-	case strings.HasPrefix(response[bodyOffset:], "\n"):
-		bodyOffset++
-	default:
-		return "", false, fmt.Errorf("missing fetch literal separator")
-	}
-
-	if len(response[bodyOffset:]) < bodyLength {
-		return "", false, fmt.Errorf("fetch literal truncated: expected %d bytes, got %d", bodyLength, len(response[bodyOffset:]))
-	}
-
-	return response[bodyOffset : bodyOffset+bodyLength], true, nil
 }
 
 func extractSearchableBody(rawMessage string) (string, error) {
@@ -281,155 +258,6 @@ func parseInternalDateToUnixMilli(internalDateStr string) int64 {
 	return parsedTime.UnixMilli()
 }
 
-// parseSingleMailResponse parses a single mail response line (similar to parseSingleEmailResponse but returns Mail)
-func (c *IMAPClient) parseSingleMailResponse(response string) *Mail {
-	// Parse UID, ENVELOPE, and INTERNALDATE from response manually with robust error handling
-	// Format: * 1 FETCH (UID 1 INTERNALDATE "..." ENVELOPE (...))
-	if strings.Contains(response, "UID") && strings.Contains(response, "INTERNALDATE") && strings.Contains(response, "ENVELOPE") {
-		// Find UID with bounds checking
-		uidStart := strings.Index(response, "UID ")
-		if uidStart == -1 {
-			return nil
-		}
-		uidStart += 4
-		uidEnd := strings.Index(response[uidStart:], " ")
-		if uidEnd == -1 {
-			return nil
-		}
-		uid := response[uidStart : uidStart+uidEnd]
-
-		// Find INTERNALDATE with bounds checking
-		internalDateStart := strings.Index(response, "INTERNALDATE \"")
-		if internalDateStart == -1 {
-			return nil
-		}
-		internalDateStart += 14
-		internalDateEnd := strings.Index(response[internalDateStart:], "\"")
-		if internalDateEnd == -1 {
-			return nil
-		}
-		internalDate := response[internalDateStart : internalDateStart+internalDateEnd]
-
-		// Find ENVELOPE data with robust parenthesis matching
-		envelopeStart := strings.Index(response, "ENVELOPE (")
-		if envelopeStart == -1 {
-			return nil
-		}
-		envelopeStart += 10
-		envelopeEnd := envelopeStart
-		parenCount := 1
-		for i := envelopeStart; i < len(response); i++ {
-			if response[i] == '(' {
-				parenCount++
-			} else if response[i] == ')' {
-				parenCount--
-				if parenCount == 0 {
-					envelopeEnd = i
-					break
-				}
-			}
-		}
-
-		// Validate envelope data was found
-		if envelopeEnd <= envelopeStart {
-			return nil
-		}
-
-		envelopeData := response[envelopeStart:envelopeEnd]
-
-		// Parse envelope data
-		envelope := c.parseEnvelope(envelopeData)
-
-		// Only return if we have valid data
-		if uid != "" && internalDate != "" {
-			return &Mail{
-				UID:          uid,
-				Subject:      envelope.Subject,
-				From:         envelope.From,
-				To:           envelope.To,
-				Date:         envelope.Date,
-				InternalDate: parseInternalDateToUnixMilli(internalDate),
-				Body:         "", // Will be set later
-			}
-		}
-	}
-
-	return nil
-}
-
-// parseSingleEmailResponse parses a single email response line
-func (c *IMAPClient) parseSingleEmailResponse(response string, headers *[]EmailHeaders) {
-	// Parse UID, ENVELOPE, and INTERNALDATE from response manually with robust error handling
-	// Format: * 1 FETCH (UID 1 INTERNALDATE "..." ENVELOPE (...))
-	if strings.Contains(response, "UID") && strings.Contains(response, "INTERNALDATE") && strings.Contains(response, "ENVELOPE") {
-		// Find UID with bounds checking
-		uidStart := strings.Index(response, "UID ")
-		if uidStart == -1 {
-			return
-		}
-		uidStart += 4
-		uidEnd := strings.Index(response[uidStart:], " ")
-		if uidEnd == -1 {
-			return
-		}
-		uid := response[uidStart : uidStart+uidEnd]
-
-		// Find INTERNALDATE with bounds checking
-		internalDateStart := strings.Index(response, "INTERNALDATE \"")
-		if internalDateStart == -1 {
-			return
-		}
-		internalDateStart += 14
-		internalDateEnd := strings.Index(response[internalDateStart:], "\"")
-		if internalDateEnd == -1 {
-			return
-		}
-		internalDate := response[internalDateStart : internalDateStart+internalDateEnd]
-
-		// Find ENVELOPE data with robust parenthesis matching
-		envelopeStart := strings.Index(response, "ENVELOPE (")
-		if envelopeStart == -1 {
-			return
-		}
-		envelopeStart += 10
-		envelopeEnd := envelopeStart
-		parenCount := 1
-		for i := envelopeStart; i < len(response); i++ {
-			if response[i] == '(' {
-				parenCount++
-			} else if response[i] == ')' {
-				parenCount--
-				if parenCount == 0 {
-					envelopeEnd = i
-					break
-				}
-			}
-		}
-
-		// Validate envelope data was found
-		if envelopeEnd <= envelopeStart {
-			return
-		}
-
-		envelopeData := response[envelopeStart:envelopeEnd]
-
-		// Parse envelope data
-		envelope := c.parseEnvelope(envelopeData)
-
-		// Only add if we have valid data
-		if uid != "" && internalDate != "" {
-			*headers = append(*headers, EmailHeaders{
-				UID:          uid,
-				Subject:      envelope.Subject,
-				From:         envelope.From,
-				To:           envelope.To,
-				Date:         envelope.Date,
-				InternalDate: parseInternalDateToUnixMilli(internalDate),
-			})
-		}
-	}
-}
-
 // EnvelopeData represents parsed envelope information
 type EnvelopeData struct {
 	Subject string
@@ -493,14 +321,24 @@ func (c *IMAPClient) parseEnvelopeFields(data string) []string {
 
 		char := data[i]
 		switch char {
+		case '\\':
+			current.WriteByte(char)
+			if inQuotes && i+1 < len(data) {
+				i++
+				current.WriteByte(data[i])
+			}
 		case '"':
 			inQuotes = !inQuotes
 			current.WriteByte(char)
 		case '(':
-			parenCount++
+			if !inQuotes {
+				parenCount++
+			}
 			current.WriteByte(char)
 		case ')':
-			parenCount--
+			if !inQuotes {
+				parenCount--
+			}
 			current.WriteByte(char)
 		case ' ':
 			if parenCount == 0 && !inQuotes {
@@ -564,8 +402,8 @@ func (c *IMAPClient) cleanEnvelopeField(field string) string {
 	if field == "NIL" {
 		return ""
 	}
-	if strings.HasPrefix(field, "\"") && strings.HasSuffix(field, "\"") {
-		field = field[1 : len(field)-1]
+	if unquoted, ok := imapString(field); ok && strings.HasPrefix(field, "\"") {
+		field = unquoted
 	}
 
 	// Decode MIME-encoded headers (RFC 2047) using Go's built-in mime package

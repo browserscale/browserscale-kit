@@ -215,10 +215,11 @@ func (c *IMAPClient) readCommandResponses(commandTag string) (string, []string, 
 			return "", dataResponses, err
 		}
 
-		// Check if this is the final response for our command
-		if strings.Contains(response, commandTag+" OK") ||
-			strings.Contains(response, commandTag+" NO") ||
-			strings.Contains(response, commandTag+" BAD") {
+		// Only the tagged completion starts with the tag; message data in an
+		// untagged response can contain the same text.
+		if strings.HasPrefix(response, commandTag+" OK") ||
+			strings.HasPrefix(response, commandTag+" NO") ||
+			strings.HasPrefix(response, commandTag+" BAD") {
 			finalResponse = response
 			break
 		}
