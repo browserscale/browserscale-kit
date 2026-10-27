@@ -27,9 +27,9 @@ import (
 
 // Program is a bot with several tasks: kinds of jobs that run side by side
 // in one run, each from its own source, with its own threads and ends. Signups
-// in browsers next to a task that watches a mailbox, or a service that keeps
-// running and takes its jobs from a queue. A job rents a browser only when it
-// uses one, so jobs that talk to a mailbox or an API cost none.
+// in browsers next to a task that warms up the new accounts, or a service
+// that keeps running and takes its jobs from a queue. A job rents a browser
+// only when it uses one, so jobs that talk to a mailbox or an API cost none.
 //
 // A [Bot] is a program with one task; use it unless the bot needs more.
 type Program[S any] struct {

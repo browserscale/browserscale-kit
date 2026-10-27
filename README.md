@@ -55,13 +55,13 @@ func main() {
 
 - **Settings.** A typed form (`form`) that renders as terminal prompts, as JSON and as the settings screen in Studio, saved to `data/config.json`.
 - **Jobs and threads.** `Times`, `Until`, `Lines` and `Rows` for a number of jobs or an input file, `Forever`, `Every` and `At` for a run that keeps going, `Queue` for jobs other jobs hand over. Each job gets its own browser the first time it asks for one.
-- **Programs.** Several tasks side by side in one run, such as signups next to a task that watches the mailbox, handing each other work with `Run.Push` and `Run.Post`.
+- **Programs.** Several tasks side by side in one run, such as signups next to a task that warms up the new accounts, handing each other work with `Run.Push` and `Run.Post`.
 - **Steps.** A job can be written as steps with `Job.Flow`; the kit reports which step each job is in, and a run can start at one (`-from`) or stop after one (`-until`).
 - **Errors.** Trouble with the browser or the proxy is retried with a fresh browser, and another proxy when the proxy was at fault. Outcomes of the site end the job by the bot's own names. Anything else ends it as `error` with its step and a screenshot, and stops the run when the same step keeps failing.
 - **Proxies.** Lists, provider gateways, static addresses and mobile proxies, or browserscale's managed proxies; http and socks5, with MASQUE for HTTP/3. A failed proxy rests or rotates according to its kind (`proxy`).
 - **Store.** What jobs keep across runs, in `data/store.db`, with atomic updates that hold across processes (`store`).
 - **Runs.** Every run writes its events, its settings, one row per job and what jobs saved to `runs/<run>/`.
-- **Mail.** An IMAP code fetcher for one-time verification codes (`mail`).
+- **Mail.** Verification codes and links over IMAP (`mail`): one shared `Fetcher` per mailbox, and each job arms `Expect` before the action that sends the mail and collects the code with `Wait.Code`, however many jobs wait at once.
 
 The package documentation (`go doc github.com/browserscale/browserscale-kit`) covers all of it, including the flags for developing a bot.
 

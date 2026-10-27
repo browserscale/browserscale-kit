@@ -185,8 +185,7 @@ func (r *Run) Fail(err error) { r.c.Fail(err) }
 func (r *Run) Stopped() bool { return r.c.Stopped() }
 
 // Push hands item to the task whose jobs come from Queue under name, e.g. a
-// confirmation link a mailbox task found for a task that opens it in a
-// browser. Jobs push with j.Run().Push.
+// new account for the task that warms it up. Jobs push with j.Run().Push.
 func (r *Run) Push(name string, item any) {
 	r.c.mu.Lock()
 	r.c.queues[name] = append(r.c.queues[name], item)
@@ -194,9 +193,9 @@ func (r *Run) Push(name string, item any) {
 	r.c.mu.Unlock()
 }
 
-// Post leaves value under key for the job that awaits it with Await, e.g. a
-// code a mailbox task found, under its recipient's address. A value nobody
-// takes is dropped after an hour.
+// Post leaves value under key for the job that awaits it with Await, e.g. an
+// invitation link one job created, for the job that redeems it. A value
+// nobody takes is dropped after an hour.
 func (r *Run) Post(key string, value any) {
 	now := time.Now()
 	r.c.mu.Lock()

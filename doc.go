@@ -49,23 +49,24 @@
 //
 // A [Program] has several [Task]s: kinds of jobs that run side by side in
 // one run, each with its own source, threads and ends, such as signups in
-// browsers next to a task that watches the mailbox, or a service that runs
-// until it is stopped and takes its work from a queue:
+// browsers next to a task that warms up the new accounts, or a service that
+// runs until it is stopped and takes its work from a queue:
 //
 //	kit.Main(kit.Program[Settings]{
 //		Name:     "outlook-register",
 //		Settings: settings,
 //		Tasks: []kit.Tasker[Settings]{
 //			kit.Task[Settings, Account]{Name: "signup", Jobs: accounts, Threads: threads, Job: register, Ends: ends},
-//			kit.Task[Settings, int]{Name: "inbox", Jobs: everyTenSeconds, Job: readInbox},
+//			kit.Task[Settings, Account]{Name: "warmup", Jobs: warmupQueue, Threads: threads, Job: warmup},
 //		},
 //	})
 //
 // Tasks hand each other work in two ways. [Run.Push] puts an item into a
-// queue that a task reads with [Queue]: a confirmation link the inbox found,
-// for a task that opens it in a browser. [Run.Post] leaves a value under a
-// key that one job takes with [Await]: the code for an address, for the
-// signup waiting on it. A job reaches both through [Job.Run].
+// queue that a task reads with [Queue]: a new account, for the task that
+// warms it up. [Run.Post] leaves a value under a key that one job takes with
+// [Await]: an invitation link one job created, for the job that redeems it.
+// A job reaches both through [Job.Run]. Codes sent by email need neither:
+// each job waits for its own with a shared mail.Fetcher (package mail).
 //
 // A run ends once every task ran out of jobs; a task fed by a queue runs
 // out when nothing more can come. A task with [Forever], [Every] or [At]
