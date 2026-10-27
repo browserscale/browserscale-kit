@@ -5,6 +5,7 @@ go 1.25.8
 require (
 	charm.land/huh/v2 v2.0.3
 	github.com/browserscale/browserscale-go v1.12.0
+	golang.org/x/text v0.40.0
 	google.golang.org/grpc v1.84.0
 	modernc.org/sqlite v1.51.0
 )
@@ -39,7 +40,6 @@ require (
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	modernc.org/libc v1.72.3 // indirect

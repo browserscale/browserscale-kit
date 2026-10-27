@@ -2,43 +2,90 @@ package mail_test
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/browserscale/browserscale-kit/mail"
 )
 
-// triggerSend stands in for the browser action that makes the site send its
-// verification email, e.g. page.Click(ctx, browserscale.CSS("#send-code")).
-func triggerSend() error { return nil }
-
-// ExampleCodeFetcher_FetchCode shows the mailTime idiom: capture the timestamp
-// BEFORE the action that triggers the send, then pass it (minus a skew buffer)
-// as sinceUnixMilli so only the fresh code matches — never a stale one left in
-// a reused / catch-all mailbox.
-func ExampleCodeFetcher_FetchCode() {
-	f, err := mail.NewCodeFetcher("imap.example.com", 993, "catchall@example.com", "app-password")
+func ExampleFetcher_Expect() {
+	ctx := context.Background()
+	f, err := mail.NewFetcher(ctx, mail.Config{
+		Host:     "imap.example.com",
+		Username: "catchall@example.com",
+		Password: "app-password",
+	})
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	defer f.Stop()
+	defer f.Close()
 
-	mailTime := time.Now().UnixMilli() // before the trigger
-	if err := triggerSend(); err != nil {
-		panic(err)
-	}
-
-	code, err := f.FetchCode(
-		context.Background(),
-		"noreply@site.com",     // fromEmail — the sender to match
-		"user+123@example.com", // toEmail — this account's address on the catch-all
-		"",                     // subjectKeyword — none
-		`(\d{6})`,              // codeRegex — one capture group (6-digit OTP)
-		mailTime-60_000,        // sinceUnixMilli — mailTime minus ~60s clock skew
-		60_000,                 // maxSearchTimeMs — 60s budget
-		true,                   // deleteAfterFetch — expunge once read
-	)
+	// Arm the wait first, then make the site send the mail.
+	wait := f.Expect(mail.Query{
+		From:    "noreply@site.com",
+		To:      "jane.doe@example.com",
+		Code:    `(\d{6})`,
+		Timeout: 2 * time.Minute,
+		Delete:  true,
+	})
+	// page.Click(ctx, browserscale.CSS("#send-code"))
+	code, err := wait.Code(ctx)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	_ = code
+	fmt.Println(code)
+}
+
+func ExampleFetcher_FetchCode() {
+	ctx := context.Background()
+	f, err := mail.NewFetcher(ctx, mail.Config{
+		Host:     "imap.example.com",
+		Username: "catchall@example.com",
+		Password: "app-password",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	// The mail was requested earlier; accept anything since then.
+	requestedAt := time.Now().Add(-3 * time.Minute)
+	link, err := f.FetchCode(ctx, mail.Query{
+		To:    "jane.doe@example.com",
+		Code:  `https://site\.com/verify\?token=[\w-]+`,
+		Since: requestedAt,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(link)
+}
+
+func ExampleClient() {
+	ctx := context.Background()
+	c, err := mail.Dial(ctx, mail.Config{
+		Host:     "imap.example.com",
+		Username: "catchall@example.com",
+		Password: "app-password",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
+	if _, err := c.Select(ctx, "INBOX"); err != nil {
+		log.Fatal(err)
+	}
+	uids, err := c.Search(ctx, mail.Criteria{Subject: "Your order", Limit: 10})
+	if err != nil {
+		log.Fatal(err)
+	}
+	headers, err := c.Headers(ctx, uids)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, h := range headers {
+		fmt.Println(h.InternalDate.Format(time.DateTime), h.From, h.Subject)
+	}
 }

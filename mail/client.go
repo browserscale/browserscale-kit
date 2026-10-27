@@ -1,391 +1,378 @@
 package mail
 
 import (
-	"bufio"
-	"crypto/tls"
+	"cmp"
+	"context"
+	"errors"
 	"fmt"
-	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
-// IMAPClient represents a simple IMAP client
-type IMAPClient struct {
-	conn                  net.Conn
-	reader                *bufio.Reader
-	writer                *bufio.Writer
-	username              string
-	password              string
-	server                string
-	port                  int
-	mutex                 sync.RWMutex // Protects concurrent access to the connection
-	debug                 bool         // Enable debug output for raw send/receive
-	insecureSkipTLSVerify bool         // Skip TLS certificate verification (for self-signed or internal CA certs)
+// Client is one logged-in IMAP connection. It is safe for concurrent use;
+// commands run one after another. For waiting on codes use a Fetcher, which
+// keeps a Client alive and reconnects it.
+type Client struct {
+	mu      sync.Mutex
+	conn    *conn
+	mailbox *Mailbox
 }
 
-// NewIMAPClient creates a new IMAP client for any server.
-// TLS certificate verification is always skipped (for self-signed or corporate CA certificates).
-func NewIMAPClient(server string, port int, username string, password string) *IMAPClient {
-	return &IMAPClient{
-		username:              username,
-		password:              password,
-		server:                server,
-		port:                  port,
-		debug:                 false,
-		insecureSkipTLSVerify: true,
-	}
+// Mailbox is the state of the selected mailbox.
+type Mailbox struct {
+	Name           string
+	Exists         uint32 // number of messages
+	UIDValidity    uint32 // UIDs stay valid as long as this doesn't change
+	UIDNext        uint32 // the UID the next message will get, 0 if unknown
+	ReadOnly       bool
+	PermanentFlags []string
 }
 
-// EnableDebug enables debug output for raw send/receive data
-func (c *IMAPClient) EnableDebug() {
-	c.debug = true
+// Criteria select messages for Search. Strings match as case-insensitive
+// substrings of the header or body, as the server's SEARCH does. The zero
+// value matches every message.
+type Criteria struct {
+	From    string
+	To      string
+	Subject string
+	Body    string
+	// Since and Before compare dates only, without time of day, in the
+	// server's view of the INTERNALDATE.
+	Since  time.Time
+	Before time.Time
+	// Limit keeps only the newest Limit UIDs, 0 keeps all.
+	Limit int
 }
 
-// IsDebug returns whether debug mode is enabled
-func (c *IMAPClient) IsDebug() bool {
-	return c.debug
-}
-
-// Connect establishes a connection to IMAP server
-func (c *IMAPClient) Connect() error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	// Connect to IMAP server
-	addr := c.server + ":" + strconv.Itoa(c.port)
-	tlsConfig := &tls.Config{ServerName: c.server}
-	if c.insecureSkipTLSVerify {
-		tlsConfig.InsecureSkipVerify = true
-	}
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+// Dial connects over TLS and logs in.
+func Dial(ctx context.Context, cfg Config) (*Client, error) {
+	cfg = cfg.withDefaults()
+	dialCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	nc, err := cfg.connect(dialCtx)
+	cancel()
 	if err != nil {
-		return fmt.Errorf("failed to connect to IMAP server: %v", err)
-	}
-
-	c.conn = conn
-	c.reader = bufio.NewReader(conn)
-	c.writer = bufio.NewWriter(conn)
-
-	// Read initial server response
-	_, err = c.readResponseUnsafe()
-	if err != nil {
-		return fmt.Errorf("failed to read initial response: %v", err)
-	}
-
-	// Check server features by sending CAPABILITY command
-	features, err := c.checkServerFeatures()
-	if err != nil {
-		return fmt.Errorf("failed to check server features: %v", err)
-	}
-
-	// Validate that server supports required modern features
-	if err := ValidateModernFeatures(features); err != nil {
-		return fmt.Errorf("server compatibility check failed: %v", err)
-	}
-
-	// Login
-	if err := c.login(); err != nil {
-		return fmt.Errorf("login failed: %v", err)
-	}
-	return nil
-}
-
-// login authenticates with the IMAP server
-func (c *IMAPClient) login() error {
-	// Send LOGIN command
-	command := fmt.Sprintf("A001 LOGIN \"%s\" \"%s\"\r\n", c.username, c.password)
-	if err := c.sendCommandUnsafe(command); err != nil {
-		return err
-	}
-
-	// Read all responses until we get the final OK
-	for {
-		response, err := c.readResponseUnsafe()
-		if err != nil {
-			return err
-		}
-
-		if strings.Contains(response, "A001 OK") {
-			return nil
-		}
-		if strings.Contains(response, "A001 NO") || strings.Contains(response, "A001 BAD") {
-			return fmt.Errorf("login failed: %s", response)
-		}
-	}
-}
-
-// sendCommand sends a command to the IMAP server
-func (c *IMAPClient) sendCommand(command string) error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	return c.sendCommandUnsafe(command)
-}
-
-// sendCommandUnsafe sends a command without acquiring the mutex (for internal use)
-func (c *IMAPClient) sendCommandUnsafe(command string) error {
-	if c.debug {
-		fmt.Printf("SEND: %s", command)
-	}
-	_, err := c.writer.WriteString(command)
-	if err != nil {
-		return fmt.Errorf("failed to send command: %v", err)
-	}
-	return c.writer.Flush()
-}
-
-// readResponse reads a response from the IMAP server
-func (c *IMAPClient) readResponse() (string, error) {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-
-	return c.readResponseUnsafe()
-}
-
-// readResponseUnsafe reads a response without acquiring the mutex (for internal use)
-func (c *IMAPClient) readResponseUnsafe() (string, error) {
-	var response strings.Builder
-
-	chunk, err := c.reader.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %v", err)
-	}
-	response.WriteString(chunk)
-
-	for {
-		literalLength, hasLiteral := parseTrailingLiteralLength(chunk)
-		if !hasLiteral {
-			break
-		}
-
-		literalBytes, err := c.readBytesUnsafe(literalLength)
-		if err != nil {
-			return "", fmt.Errorf("failed to read response literal: %v", err)
-		}
-		response.Write(literalBytes)
-
-		chunk, err = c.reader.ReadString('\n')
-		if err != nil {
-			return "", fmt.Errorf("failed to read response continuation: %v", err)
-		}
-		response.WriteString(chunk)
-	}
-
-	fullResponse := response.String()
-	if c.debug {
-		fmt.Printf("RECV: %s", fullResponse)
-	}
-	return fullResponse, nil
-}
-
-func parseTrailingLiteralLength(responseLine string) (int, bool) {
-	trimmed := strings.TrimRight(responseLine, "\r\n")
-	if !strings.HasSuffix(trimmed, "}") {
-		return 0, false
-	}
-
-	start := strings.LastIndex(trimmed, "{")
-	if start == -1 || start >= len(trimmed)-1 {
-		return 0, false
-	}
-
-	literalLength := trimmed[start+1 : len(trimmed)-1]
-	literalLength = strings.TrimSuffix(literalLength, "+")
-	if literalLength == "" {
-		return 0, false
-	}
-
-	length, err := strconv.Atoi(literalLength)
-	if err != nil {
-		return 0, false
-	}
-
-	return length, true
-}
-
-// readCommandResponses reads all responses until the final response for a command
-// Returns the final response and any data responses (responses starting with *)
-func (c *IMAPClient) readCommandResponses(commandTag string) (string, []string, error) {
-	var dataResponses []string
-	var finalResponse string
-
-	for {
-		response, err := c.readResponseUnsafe()
-		if err != nil {
-			return "", dataResponses, err
-		}
-
-		// Only the tagged completion starts with the tag; message data in an
-		// untagged response can contain the same text.
-		if strings.HasPrefix(response, commandTag+" OK") ||
-			strings.HasPrefix(response, commandTag+" NO") ||
-			strings.HasPrefix(response, commandTag+" BAD") {
-			finalResponse = response
-			break
-		}
-
-		// This is a data response (starts with *)
-		dataResponses = append(dataResponses, response)
-	}
-
-	return finalResponse, dataResponses, nil
-}
-
-// readBytes reads a specific number of bytes from the IMAP server
-func (c *IMAPClient) readBytes(length int) ([]byte, error) {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-
-	return c.readBytesUnsafe(length)
-}
-
-// readBytesUnsafe reads bytes without acquiring the mutex (for internal use)
-func (c *IMAPClient) readBytesUnsafe(length int) ([]byte, error) {
-	buffer := make([]byte, length)
-	totalRead := 0
-
-	for totalRead < length {
-		n, err := c.reader.Read(buffer[totalRead:])
-		if err != nil {
-			return nil, fmt.Errorf("failed to read %d bytes (read %d): %v", length, totalRead, err)
-		}
-		totalRead += n
-	}
-
-	return buffer, nil
-}
-
-// ListMailboxes lists available mailboxes
-func (c *IMAPClient) ListMailboxes() error {
-	command := "A002 LIST \"\" \"*\"\r\n"
-	if err := c.sendCommand(command); err != nil {
-		return err
-	}
-
-	// Read all responses until we get the final OK
-	for {
-		response, err := c.readResponse()
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Mailbox: %s", response)
-
-		if strings.Contains(response, "A002 OK") {
-			break
-		}
-	}
-	return nil
-}
-
-// SelectInbox selects the INBOX
-func (c *IMAPClient) SelectInbox() error {
-	command := "A003 SELECT INBOX\r\n"
-	if err := c.sendCommand(command); err != nil {
-		return err
-	}
-
-	// Read all responses until we get the final OK
-	for {
-		response, err := c.readResponse()
-		if err != nil {
-			return err
-		}
-
-		if strings.Contains(response, "A003 OK") {
-			break
-		}
-	}
-	return nil
-}
-
-// Disconnect closes the connection (aggressive like Chilkat DisposeImap)
-func (c *IMAPClient) Disconnect() error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	if c.conn != nil {
-		// Just kill the socket immediately (like Chilkat DisposeImap)
-		err := c.conn.Close()
-		c.conn = nil
-		c.reader = nil
-		c.writer = nil
-		return err
-	}
-	return nil
-}
-
-// checkServerFeatures sends a CAPABILITY command to check server features
-func (c *IMAPClient) checkServerFeatures() (*IMAPFeatures, error) {
-	// Send CAPABILITY command
-	command := "A000 CAPABILITY\r\n"
-	if err := c.sendCommandUnsafe(command); err != nil {
 		return nil, err
 	}
-
-	// Read capability responses
-	features := &IMAPFeatures{
-		ServerInfo: "Connected to " + c.server,
+	c := &Client{conn: newConn(nc, cfg)}
+	if err := c.conn.open(ctx, cfg.Username, cfg.Password); err != nil {
+		_ = nc.Close()
+		return nil, err
 	}
+	return c, nil
+}
 
-	// Read all capability responses
-	for {
-		response, err := c.readResponseUnsafe()
+func (c *Client) exec(ctx context.Context, cmd *command) ([]*response, *response, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.execute(ctx, cmd)
+}
+
+// Capabilities lists what the server announced, upper-cased.
+func (c *Client) Capabilities() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.conn.caps))
+	for name := range c.conn.caps {
+		out = append(out, name)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// Has reports whether the server announced a capability, e.g. UIDPLUS.
+func (c *Client) Has(capability string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.caps[strings.ToUpper(capability)]
+}
+
+// Mailbox is the selected mailbox, nil before Select.
+func (c *Client) Mailbox() *Mailbox {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mailbox
+}
+
+// List returns the names of all mailboxes.
+func (c *Client) List(ctx context.Context) ([]string, error) {
+	untagged, _, err := c.exec(ctx, newCommand("LIST").str("").str("*"))
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, r := range untagged {
+		if r.kind != "LIST" {
+			continue
+		}
+		if _, err := r.data.value(); err != nil { // flags
+			continue
+		}
+		if _, err := r.data.value(); err != nil { // hierarchy delimiter
+			continue
+		}
+		if name, err := r.data.value(); err == nil {
+			names = append(names, name.nstring())
+		}
+	}
+	return names, nil
+}
+
+// Select opens a mailbox for reading and deleting.
+func (c *Client) Select(ctx context.Context, name string) (*Mailbox, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mailbox = nil
+	untagged, done, err := c.conn.execute(ctx, newCommand("SELECT").str(name))
+	if err != nil {
+		return nil, err
+	}
+	mb := &Mailbox{Name: name}
+	for _, r := range append(untagged, done) {
+		if r.kind == "EXISTS" {
+			mb.Exists = r.number
+		}
+		key, arg, _ := strings.Cut(r.code, " ")
+		switch strings.ToUpper(key) {
+		case "UIDVALIDITY":
+			n, _ := strconv.ParseUint(arg, 10, 32)
+			mb.UIDValidity = uint32(n)
+		case "UIDNEXT":
+			n, _ := strconv.ParseUint(arg, 10, 32)
+			mb.UIDNext = uint32(n)
+		case "PERMANENTFLAGS":
+			mb.PermanentFlags = strings.Fields(strings.Trim(arg, "()"))
+		case "READ-ONLY":
+			mb.ReadOnly = true
+		case "READ-WRITE":
+			mb.ReadOnly = false
+		}
+	}
+	c.mailbox = mb
+	return mb, nil
+}
+
+// Noop asks the server for news and keeps the connection alive.
+func (c *Client) Noop(ctx context.Context) error {
+	_, _, err := c.exec(ctx, newCommand("NOOP"))
+	return err
+}
+
+// Search returns the UIDs of the messages in the selected mailbox that
+// match, in ascending order.
+func (c *Client) Search(ctx context.Context, q Criteria) ([]uint32, error) {
+	uids, err := c.search(ctx, q, "")
+	if err != nil {
+		return nil, err
+	}
+	if q.Limit > 0 && len(uids) > q.Limit {
+		uids = uids[len(uids)-q.Limit:]
+	}
+	return uids, nil
+}
+
+// search runs UID SEARCH, optionally limited to a UID range.
+func (c *Client) search(ctx context.Context, q Criteria, uidRange string) ([]uint32, error) {
+	cmd := newCommand("UID SEARCH")
+	if !isASCII(q.From + q.To + q.Subject + q.Body) {
+		cmd.atom("CHARSET UTF-8")
+	}
+	n := 0
+	for _, kv := range [][2]string{{"FROM", q.From}, {"TO", q.To}, {"SUBJECT", q.Subject}, {"BODY", q.Body}} {
+		if kv[1] != "" {
+			cmd.atom(kv[0]).str(kv[1])
+			n++
+		}
+	}
+	if !q.Since.IsZero() {
+		cmd.atom("SINCE " + imapDate(q.Since))
+		n++
+	}
+	if !q.Before.IsZero() {
+		cmd.atom("BEFORE " + imapDate(q.Before))
+		n++
+	}
+	if uidRange != "" {
+		cmd.atom("UID " + uidRange)
+		n++
+	}
+	if n == 0 {
+		cmd.atom("ALL")
+	}
+	untagged, _, err := c.exec(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	var uids []uint32
+	for _, r := range untagged {
+		if r.kind != "SEARCH" {
+			continue
+		}
+		for !r.data.atEnd() {
+			v, err := r.data.value()
+			if err != nil {
+				break
+			}
+			if uid, ok := v.number(); ok && uid > 0 {
+				uids = append(uids, uid)
+			}
+		}
+	}
+	slices.Sort(uids)
+	return slices.Compact(uids), nil
+}
+
+// Headers returns envelope and INTERNALDATE of the given UIDs, in ascending
+// UID order. UIDs the mailbox doesn't hold are left out.
+func (c *Client) Headers(ctx context.Context, uids []uint32) ([]Header, error) {
+	want := make(map[uint32]bool, len(uids))
+	for _, uid := range uids {
+		want[uid] = true
+	}
+	var out []Header
+	for _, set := range uidSets(uids) {
+		untagged, _, err := c.exec(ctx, newCommand("UID FETCH").atom(set).atom("(UID INTERNALDATE ENVELOPE)"))
 		if err != nil {
 			return nil, err
 		}
-
-		// Check for specific capabilities in the response
-		capabilities := strings.ToUpper(response)
-
-		// INTERNALDATE is a standard IMAP4rev1 feature, so it's always supported
-		features.SupportsInternalDate = true
-
-		if strings.Contains(capabilities, "UIDPLUS") {
-			features.SupportsUIDPlus = true
-		}
-		if strings.Contains(capabilities, "CONDSTORE") {
-			features.SupportsCondStore = true
-		}
-		if strings.Contains(capabilities, "QRESYNC") {
-			features.SupportsQResync = true
-		}
-		if strings.Contains(capabilities, "MOVE") {
-			features.SupportsMove = true
-		}
-		if strings.Contains(capabilities, "BINARY") {
-			features.SupportsBinary = true
-		}
-		if strings.Contains(capabilities, "PREVIEW") {
-			features.SupportsPreview = true
-		}
-		if strings.Contains(capabilities, "SNIPPET") {
-			features.SupportsSnippet = true
-		}
-
-		// Check if this is the final response
-		if strings.HasPrefix(response, "A000 OK") || strings.HasPrefix(response, "A000 ") {
-			break
+		for _, r := range untagged {
+			items := fetchItems(r)
+			if items == nil {
+				continue
+			}
+			if h, ok := headerFromItems(items); ok && want[h.UID] {
+				want[h.UID] = false
+				out = append(out, h)
+			}
 		}
 	}
-
-	return features, nil
+	slices.SortFunc(out, func(a, b Header) int { return cmp.Compare(a.UID, b.UID) })
+	return out, nil
 }
 
-// Noop sends a NOOP command to keep the connection alive
-func (c *IMAPClient) Noop() error {
-	command := "A004 NOOP\r\n"
-	if err := c.sendCommand(command); err != nil {
-		return err
+// Fetch returns a complete message. It doesn't mark the message as seen.
+func (c *Client) Fetch(ctx context.Context, uid uint32) (*Message, error) {
+	set := strconv.FormatUint(uint64(uid), 10)
+	untagged, _, err := c.exec(ctx, newCommand("UID FETCH").atom(set).atom("(UID INTERNALDATE ENVELOPE BODY.PEEK[])"))
+	if err != nil {
+		return nil, err
 	}
+	for _, r := range untagged {
+		items := fetchItems(r)
+		if items == nil {
+			continue
+		}
+		h, ok := headerFromItems(items)
+		if !ok || h.UID != uid {
+			continue
+		}
+		raw := []byte(items["BODY[]"].text)
+		m := &Message{Header: h, Raw: raw}
+		m.Text, m.HTML, m.Body = readBody(raw)
+		return m, nil
+	}
+	return nil, fmt.Errorf("%w: UID %d", ErrNotFound, uid)
+}
 
-	// Read all responses until we get the final OK for our command
-	finalResponse, _, err := c.readCommandResponses("A004")
+// Delete removes messages from the selected mailbox for good. Servers
+// without UIDPLUS can only expunge every message marked \Deleted at once,
+// which then includes messages other clients marked.
+func (c *Client) Delete(ctx context.Context, uids ...uint32) error {
+	mb := c.Mailbox()
+	if mb == nil {
+		return errors.New("mail: Delete needs a selected mailbox")
+	}
+	if mb.ReadOnly {
+		return fmt.Errorf("mail: mailbox %s is read-only", mb.Name)
+	}
+	for _, set := range uidSets(uids) {
+		if _, _, err := c.exec(ctx, newCommand("UID STORE").atom(set).atom(`+FLAGS.SILENT (\Deleted)`)); err != nil {
+			var ce *CommandError
+			if !errors.As(err, &ce) {
+				return err
+			}
+			// Some servers reject UID STORE; go by message numbers instead.
+			if err := c.storeBySequence(ctx, set); err != nil {
+				return err
+			}
+		}
+		if c.Has("UIDPLUS") {
+			_, _, err := c.exec(ctx, newCommand("UID EXPUNGE").atom(set))
+			if err == nil {
+				continue
+			}
+			var ce *CommandError
+			if !errors.As(err, &ce) {
+				return err
+			}
+		}
+		if _, _, err := c.exec(ctx, newCommand("EXPUNGE")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) storeBySequence(ctx context.Context, set string) error {
+	untagged, _, err := c.exec(ctx, newCommand("UID FETCH").atom(set).atom("(UID)"))
 	if err != nil {
 		return err
 	}
+	var seqs []uint32
+	for _, r := range untagged {
+		if r.kind == "FETCH" && r.number > 0 {
+			seqs = append(seqs, r.number)
+		}
+	}
+	if len(seqs) == 0 {
+		return fmt.Errorf("%w: UID %s", ErrNotFound, set)
+	}
+	for _, seqSet := range uidSets(seqs) {
+		if _, _, err := c.exec(ctx, newCommand("STORE").atom(seqSet).atom(`+FLAGS.SILENT (\Deleted)`)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	// Check if NOOP was successful
-	if strings.Contains(finalResponse, "A004 OK") {
+// Close logs out and closes the connection.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.logout()
+}
+
+// fetchItems reads the item list of a FETCH response into a map keyed by
+// upper-cased item name, whatever order the server sends them in.
+func fetchItems(r *response) map[string]value {
+	if r.kind != "FETCH" {
 		return nil
 	}
-	return fmt.Errorf("NOOP command failed: %s", finalResponse)
+	sc := r.data
+	sc.skipSpaces()
+	if sc.i >= len(sc.s) || sc.s[sc.i] != '(' {
+		return nil
+	}
+	sc.i++
+	items := map[string]value{}
+	for {
+		sc.skipSpaces()
+		if sc.i >= len(sc.s) {
+			return nil
+		}
+		if sc.s[sc.i] == ')' {
+			return items
+		}
+		name := strings.ToUpper(sc.itemName())
+		if name == "" {
+			return nil
+		}
+		v, err := sc.value()
+		if err != nil {
+			return nil
+		}
+		items[name] = v
+	}
 }
