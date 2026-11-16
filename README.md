@@ -24,38 +24,38 @@ import (
 )
 
 type Settings struct {
-	Accounts int    `json:"accounts"`
+	Products string `json:"products"`
 	Threads  int    `json:"threads"`
 	Proxies  string `json:"proxies"`
 }
 
 func main() {
-	kit.Main(kit.Bot[Settings, Account]{
-		Name: "outlook-register",
+	kit.Main(kit.Bot[Settings, string]{
+		Name: "price-watch",
 		Settings: func(f *form.Form, s *Settings) {
-			f.Int("accounts", &s.Accounts).Label("Accounts to create").Default(1).Min(1)
-			f.Int("threads", &s.Threads).Label("Threads").Help("How many signups run at once").Default(1).Min(1)
+			f.File("products", &s.Products).Label("Product pages").Help("A file with one URL per line").Default("products.txt")
+			f.Int("threads", &s.Threads).Label("Threads").Help("How many pages are checked at once").Default(1).Min(1)
 			f.Proxies("proxies", &s.Proxies).Label("Proxies").Kinds(proxy.KindGateway, proxy.KindManaged).Fresh()
 		},
-		Jobs:    func(r *kit.Run, s *Settings) iter.Seq[Account] { return kit.Until(r, s.Accounts, newAccount, "registered") },
+		Jobs:    func(r *kit.Run, s *Settings) iter.Seq[string] { return kit.Lines(r, s.Products) },
 		Threads: func(s *Settings) int { return s.Threads },
-		Job:     register,
+		Job:     check,
 		Ends: kit.Ends{
-			"registered":     kit.Good,
-			"phone_required": kit.Neutral,
-			"blocked":        kit.Bad.ChangeProxy(),
+			"in_stock": kit.Good,
+			"sold_out": kit.Neutral,
+			"blocked":  kit.Bad.ChangeProxy(),
 		},
 	})
 }
 ```
 
-`register` is the job, `func(j *kit.Job, s *Settings, a Account) error`: it opens the job's page with `j.Page()`, goes through the signup, and ends the job by one of the names in `Ends` with `j.End`, or returns an error. Everything around it is the kit's.
+`check` is the job, `func(j *kit.Job, s *Settings, url string) error`: it opens the job's page with `j.Page()`, reads the price and whether the product can be had, and ends the job by one of the names in `Ends` with `j.End`, or returns an error. Everything around it is the kit's.
 
 ## What it does for you
 
 - **Settings.** A typed form (`form`) that renders as terminal prompts, as JSON and as the settings screen in Studio, saved to `data/config.json`.
 - **Jobs and threads.** `Times`, `Until`, `Lines` and `Rows` for a number of jobs or an input file, `Forever`, `Every` and `At` for a run that keeps going, `Queue` for jobs other jobs hand over. Each job gets its own browser the first time it asks for one.
-- **Programs.** Several tasks side by side in one run, such as signups next to a task that warms up the new accounts, handing each other work with `Run.Push` and `Run.Post`.
+- **Programs.** Several tasks side by side in one run, such as checks in browsers next to a task that reports what changed, handing each other work with `Run.Push` and `Run.Post`.
 - **Steps.** A job can be written as steps with `Job.Flow`; the kit reports which step each job is in, and a run can start at one (`-from`) or stop after one (`-until`).
 - **Errors.** Trouble with the browser or the proxy is retried with a fresh browser, and another proxy when the proxy was at fault. Outcomes of the site end the job by the bot's own names. Anything else ends it as `error` with its step and a screenshot, and stops the run when the same step keeps failing.
 - **Proxies.** Lists, provider gateways, static addresses and mobile proxies, or browserscale's managed proxies; http and socks5, with MASQUE for HTTP/3. A failed proxy rests or rotates according to its kind (`proxy`).

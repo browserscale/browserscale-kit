@@ -185,7 +185,7 @@ func (r *Run) Fail(err error) { r.c.Fail(err) }
 func (r *Run) Stopped() bool { return r.c.Stopped() }
 
 // Push hands item to the task whose jobs come from Queue under name, e.g. a
-// new account for the task that warms it up. Jobs push with j.Run().Push.
+// price that changed for the task that reports it. Jobs push with j.Run().Push.
 func (r *Run) Push(name string, item any) {
 	r.c.mu.Lock()
 	r.c.queues[name] = append(r.c.queues[name], item)

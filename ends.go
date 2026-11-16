@@ -49,7 +49,7 @@ func (e End) ChangeProxy() End {
 func (e End) Tone() Tone { return e.tone }
 
 // Ends names the ways a job can end and what each means. The names are the
-// bot's own, such as "registered", "phone_required" or "price_changed"; a
+// bot's own, such as "in_stock", "sold_out" or "price_changed"; a
 // bot has as many as it needs, of whatever tones. They are what a run
 // reports and counts.
 //

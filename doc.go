@@ -3,30 +3,30 @@
 // configured proxies, and reports every step and end as it happens.
 //
 // A bot is a [Bot] value passed to [Main]. Its settings say what the run is
-// for in the user's terms, such as how many accounts to create, and how many
+// for in the user's terms, such as which product pages to check, and how many
 // jobs run at once:
 //
 //	type Settings struct {
-//		Accounts int    `json:"accounts"`
+//		Products string `json:"products"`
 //		Threads  int    `json:"threads"`
 //		Proxies  string `json:"proxies"`
 //	}
 //
 //	func main() {
-//		kit.Main(kit.Bot[Settings, Account]{
-//			Name: "outlook-register",
+//		kit.Main(kit.Bot[Settings, string]{
+//			Name: "price-watch",
 //			Settings: func(f *form.Form, s *Settings) {
-//				f.Int("accounts", &s.Accounts).Label("Accounts to create").Default(1).Min(1)
-//				f.Int("threads", &s.Threads).Label("Threads").Help("How many signups run at once").Default(1).Min(1)
+//				f.File("products", &s.Products).Label("Product pages").Help("A file with one URL per line").Default("products.txt")
+//				f.Int("threads", &s.Threads).Label("Threads").Help("How many pages are checked at once").Default(1).Min(1)
 //				f.Proxies("proxies", &s.Proxies).Label("Proxies").Kinds(proxy.KindGateway, proxy.KindManaged).Fresh()
 //			},
-//			Jobs:    func(r *kit.Run, s *Settings) iter.Seq[Account] { return kit.Until(r, s.Accounts, newAccount, "registered") },
+//			Jobs:    func(r *kit.Run, s *Settings) iter.Seq[string] { return kit.Lines(r, s.Products) },
 //			Threads: func(s *Settings) int { return s.Threads },
-//			Job:     register,
+//			Job:     check,
 //			Ends: kit.Ends{
-//				"registered":     kit.Good,
-//				"phone_required": kit.Neutral,
-//				"blocked":        kit.Bad.ChangeProxy(),
+//				"in_stock": kit.Good,
+//				"sold_out": kit.Neutral,
+//				"blocked":  kit.Bad.ChangeProxy(),
 //			},
 //		})
 //	}
@@ -34,8 +34,8 @@
 // # Jobs and threads
 //
 // Jobs says what the run works through: [Times] for a number of jobs,
-// [Until] for jobs until enough ended a given way (accounts created, however
-// many signups got blocked on the way), [Lines] and [Rows] for an input
+// [Until] for jobs until enough ended a given way (results collected, however
+// many tries got blocked on the way), [Lines] and [Rows] for an input
 // file, [Forever], [Every] and [At] for a run that keeps going, and [Queue]
 // for jobs that other jobs hand over. Threads is how many jobs run at once.
 // Each job gets its own browser, rented the first time it calls
@@ -48,22 +48,22 @@
 // # Programs and tasks
 //
 // A [Program] has several [Task]s: kinds of jobs that run side by side in
-// one run, each with its own source, threads and ends, such as signups in
-// browsers next to a task that warms up the new accounts, or a service that
+// one run, each with its own source, threads and ends, such as checks in
+// browsers next to a task that reports what changed, or a service that
 // runs until it is stopped and takes its work from a queue:
 //
 //	kit.Main(kit.Program[Settings]{
-//		Name:     "outlook-register",
+//		Name:     "price-watch",
 //		Settings: settings,
 //		Tasks: []kit.Tasker[Settings]{
-//			kit.Task[Settings, Account]{Name: "signup", Jobs: accounts, Threads: threads, Job: register, Ends: ends},
-//			kit.Task[Settings, Account]{Name: "warmup", Jobs: warmupQueue, Threads: threads, Job: warmup},
+//			kit.Task[Settings, string]{Name: "check", Jobs: products, Threads: threads, Job: check, Ends: ends},
+//			kit.Task[Settings, Change]{Name: "notify", Jobs: changes, Job: notify},
 //		},
 //	})
 //
 // Tasks hand each other work in two ways. [Run.Push] puts an item into a
-// queue that a task reads with [Queue]: a new account, for the task that
-// warms it up. [Run.Post] leaves a value under a key that one job takes with
+// queue that a task reads with [Queue]: a price that changed, for the task
+// that reports it. [Run.Post] leaves a value under a key that one job takes with
 // [Await]: an invitation link one job created, for the job that redeems it.
 // A job reaches both through [Job.Run]. Codes sent by email need neither:
 // each job waits for its own with a shared mail.Fetcher (package mail).

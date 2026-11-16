@@ -26,8 +26,8 @@ import (
 )
 
 // Program is a bot with several tasks: kinds of jobs that run side by side
-// in one run, each from its own source, with its own threads and ends. Signups
-// in browsers next to a task that warms up the new accounts, or a service
+// in one run, each from its own source, with its own threads and ends. Checks
+// in browsers next to a task that reports what changed, or a service
 // that keeps running and takes its jobs from a queue. A job rents a browser
 // only when it uses one, so jobs that talk to a mailbox or an API cost none.
 //

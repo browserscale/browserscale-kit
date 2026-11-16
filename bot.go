@@ -20,7 +20,7 @@ import (
 // what one job works on, such as an account. A bot with several kinds of
 // jobs side by side is a [Program].
 type Bot[S, J any] struct {
-	// Name identifies the bot, e.g. "outlook-register": the settings form's
+	// Name identifies the bot, e.g. "price-watch": the settings form's
 	// module name and the bot's namespace in the store.
 	Name string
 	// Title heads the settings form; Name when empty.
